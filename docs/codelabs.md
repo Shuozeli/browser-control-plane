@@ -25,16 +25,14 @@ export BCP_MACHINE_ID=$(hostname)
 export BCP_E2E_PROFILE_ID=youtube-main
 export BCP_E2E_ACCOUNT_ID=yt-main
 export BCP_E2E_PLATFORM=youtube
+export BCP_CONTROLLER=http://${TAILSCALE_HOST:-127.0.0.1}:7000
 cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100
 ```
 
-### Register profiles
+### Verify auto-registration
 
-Current limitation: `bcp-agent` does not auto-register with the global
-controller. Use a bootstrap client or the Docker E2E harness to call
-`RegisterMachine`.
-
-After registration, verify lookup:
+`bcp-agent` registers its profiles with the global controller when
+`BCP_CONTROLLER` is set. Wait for one registration interval, then verify lookup:
 
 ```bash
 export BCP_CONTROLLER=http://<controller-magicdns-name>:7000
@@ -82,7 +80,7 @@ This test runs:
 - two machine controllers
 - three Chrome/CDP containers per machine
 - one static web site per machine network
-- one E2E client that registers both machines and routes through the controller
+- one E2E client that validates both machines and routes through the controller
 
 Run:
 

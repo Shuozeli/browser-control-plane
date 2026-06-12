@@ -1,15 +1,20 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bcp_agent::AgentService;
 #[cfg(feature = "real-pwright")]
 use bcp_core::pwright::{RealPwrightGateway, RealPwrightProfile};
 use bcp_core::pwright::{RecordingProfileState, RecordingPwrightGateway};
+use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerClient;
 use bcp_proto::browsercontrol::v1::machine_controller_server::MachineControllerServer;
 use bcp_proto::browsercontrol::v1::{
-    A11yNode, Account, AccountPlatform, BrowserProfile, ProfileStatus,
+    A11yNode, Account, AccountPlatform, BrowserProfile, Machine, MachineStatus, ProfileStatus,
+    RegisterMachineRequest,
 };
 use clap::Parser;
+use prost::Message;
+use rusqlite::{Connection, params};
 
 #[derive(Debug, Parser)]
 #[command(name = "bcp-agent", about = "Per-machine browser controller")]
@@ -17,6 +22,10 @@ struct Args {
     /// Address to bind. Defaults to TAILSCALE_IP:7100, then 0.0.0.0:7100.
     #[arg(long, env = "BCP_AGENT_ADDR")]
     addr: Option<SocketAddr>,
+
+    /// SQLite database path for local agent profile state.
+    #[arg(long, env = "BCP_AGENT_DB")]
+    db_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -27,10 +36,19 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let addr = args.addr.unwrap_or_else(default_addr);
-    tracing::info!(%addr, "starting machine controller");
+    let db_path = args.db_path.unwrap_or_else(default_db_path);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    tracing::info!(%addr, db_path = %db_path.display(), "starting machine controller");
     let service = build_service_from_env();
+    if service.list_profiles().is_empty() {
+        hydrate_profiles_from_sqlite(&service, &db_path)?;
+    }
+    persist_profiles_to_sqlite(&service, &db_path)?;
     spawn_fleet_heartbeat(service.clone());
     spawn_artifact_cleanup(service.clone());
+    spawn_controller_registration(service.clone(), addr);
 
     tonic::transport::Server::builder()
         .add_service(MachineControllerServer::new(service))
@@ -47,14 +65,25 @@ fn default_addr() -> SocketAddr {
         .expect("default agent address should parse")
 }
 
+fn default_db_path() -> PathBuf {
+    PathBuf::from(".bcp").join("agent.sqlite")
+}
+
 fn build_service_from_env() -> AgentService {
     if let Ok(real_profiles) = std::env::var("BCP_REAL_PROFILES") {
         return build_real_service_from_env(&real_profiles);
     }
 
+    let machine_id =
+        std::env::var("BCP_MACHINE_ID").unwrap_or_else(|_| "local-machine".to_string());
     let profile_id = match std::env::var("BCP_E2E_PROFILE_ID") {
         Ok(value) => value,
-        Err(_) => return AgentService::default(),
+        Err(_) => {
+            return AgentService::new_for_machine(
+                &machine_id,
+                Arc::new(RecordingPwrightGateway::default()),
+            );
+        }
     };
     let account_id =
         std::env::var("BCP_E2E_ACCOUNT_ID").unwrap_or_else(|_| "recording-account".to_string());
@@ -62,8 +91,6 @@ fn build_service_from_env() -> AgentService {
         .ok()
         .and_then(|value| parse_platform(&value))
         .unwrap_or(AccountPlatform::Youtube);
-    let machine_id =
-        std::env::var("BCP_MACHINE_ID").unwrap_or_else(|_| "recording-machine".to_string());
 
     let profile = BrowserProfile {
         profile_id: profile_id.clone(),
@@ -99,6 +126,52 @@ fn build_service_from_env() -> AgentService {
     let service = AgentService::new_for_machine(&machine_id, Arc::new(gateway));
     service.upsert_desired_profile(profile);
     service
+}
+
+fn hydrate_profiles_from_sqlite(service: &AgentService, db_path: &Path) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)?;
+    init_agent_store(&conn)?;
+    for profile in load_agent_profiles(&conn)? {
+        service.upsert_desired_profile(profile);
+    }
+    Ok(())
+}
+
+fn persist_profiles_to_sqlite(service: &AgentService, db_path: &Path) -> anyhow::Result<()> {
+    let mut conn = Connection::open(db_path)?;
+    init_agent_store(&conn)?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM agent_profiles", [])?;
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO agent_profiles (profile_id, payload) VALUES (?1, ?2)")?;
+        for profile in service.list_profiles() {
+            stmt.execute(params![profile.profile_id, profile.encode_to_vec()])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn init_agent_store(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_profiles (
+            profile_id TEXT PRIMARY KEY,
+            payload BLOB NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+fn load_agent_profiles(conn: &Connection) -> anyhow::Result<Vec<BrowserProfile>> {
+    let mut stmt = conn.prepare("SELECT payload FROM agent_profiles ORDER BY profile_id ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut profiles = Vec::new();
+    for row in rows {
+        let payload = row?;
+        profiles.push(BrowserProfile::decode(payload.as_slice())?);
+    }
+    Ok(profiles)
 }
 
 #[cfg(feature = "real-pwright")]
@@ -214,4 +287,83 @@ fn spawn_artifact_cleanup(service: AgentService) {
             }
         }
     });
+}
+
+fn spawn_controller_registration(service: AgentService, bind_addr: SocketAddr) {
+    let Ok(controller) = std::env::var("BCP_CONTROLLER") else {
+        return;
+    };
+    let agent_grpc_addr = public_agent_addr(bind_addr);
+    let interval_seconds = std::env::var("BCP_CONTROLLER_REGISTER_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10)
+        .max(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        loop {
+            interval.tick().await;
+            if let Err(error) =
+                register_with_controller(&controller, &agent_grpc_addr, &service).await
+            {
+                tracing::warn!(%error, controller, "controller registration failed");
+            }
+        }
+    });
+}
+
+async fn register_with_controller(
+    controller: &str,
+    agent_grpc_addr: &str,
+    service: &AgentService,
+) -> anyhow::Result<()> {
+    let machine_id = service.machine_id();
+    let mut client = GlobalControllerClient::connect(controller.to_string()).await?;
+    client
+        .register_machine(RegisterMachineRequest {
+            machine: Some(Machine {
+                machine_id: machine_id.clone(),
+                hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| machine_id.clone()),
+                tailscale_host: std::env::var("TAILSCALE_HOST").unwrap_or_default(),
+                agent_grpc_addr: agent_grpc_addr.to_string(),
+                status: MachineStatus::Online as i32,
+                labels: parse_labels_env("BCP_MACHINE_LABELS"),
+                last_heartbeat_unix_ms: 0,
+            }),
+            profiles: service.list_profiles(),
+        })
+        .await?;
+    Ok(())
+}
+
+fn public_agent_addr(bind_addr: SocketAddr) -> String {
+    if let Ok(value) = std::env::var("BCP_AGENT_PUBLIC_ADDR") {
+        return value;
+    }
+    if let Ok(value) = std::env::var("BCP_AGENT_GRPC_ADDR") {
+        return value;
+    }
+    if let Ok(host) = std::env::var("TAILSCALE_HOST") {
+        return format!("http://{}:{}", host.trim_end_matches('.'), bind_addr.port());
+    }
+    if bind_addr.ip().is_unspecified() {
+        return format!("http://127.0.0.1:{}", bind_addr.port());
+    }
+    format!("http://{}:{}", bind_addr.ip(), bind_addr.port())
+}
+
+fn parse_labels_env(name: &str) -> std::collections::HashMap<String, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|entry| {
+                    let (key, value) = entry.split_once('=')?;
+                    Some((key.trim().to_string(), value.trim().to_string()))
+                })
+                .filter(|(key, _)| !key.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }

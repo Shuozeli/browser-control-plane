@@ -1,11 +1,14 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 
 use bcp_core::id::{IdGenerator, UuidIdGenerator};
 use bcp_core::network::{NetworkDirectory, StaticNetworkDirectory};
 use bcp_core::time::{Clock, SystemClock};
 use bcp_proto::browsercontrol::v1::global_controller_server::GlobalController;
 use bcp_proto::browsercontrol::v1::*;
+use prost::Message;
+use rusqlite::{Connection, params};
 use tonic::{Request, Response, Status};
 
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 300;
@@ -19,6 +22,7 @@ pub struct ControllerService {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
     network: Arc<StaticNetworkDirectory>,
+    store: Option<Arc<Mutex<Connection>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,7 +76,40 @@ impl ControllerService {
             clock,
             ids,
             network,
+            store: None,
         }
+    }
+
+    pub fn new_with_sqlite(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        network: Arc<StaticNetworkDirectory>,
+    ) -> anyhow::Result<Self> {
+        let conn = Connection::open(path)?;
+        init_store(&conn)?;
+        let state = load_state(&conn)?;
+        for machine in state.machines.values() {
+            network.upsert_machine(machine.clone());
+        }
+        Ok(Self {
+            state: Arc::new(RwLock::new(state)),
+            clock,
+            ids,
+            network,
+            store: Some(Arc::new(Mutex::new(conn))),
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn persist_state(&self, state: &ControllerState) -> Result<(), Status> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let mut conn = store
+            .lock()
+            .map_err(|_| Status::internal("controller sqlite lock poisoned"))?;
+        persist_state(&mut conn, state).map_err(|error| Status::internal(error.to_string()))
     }
 
     fn machine_matches(machine: &Machine, selector: &HashMap<String, String>) -> bool {
@@ -329,13 +366,14 @@ impl ControllerService {
             .cloned()
     }
 
-    fn mark_expired_leases(state: &mut ControllerState, now_unix_ms: i64) {
+    fn mark_expired_leases(state: &mut ControllerState, now_unix_ms: i64) -> bool {
         let expired_profile_ids: Vec<String> = state
             .leases
             .values()
             .filter(|lease| lease.expires_at_unix_ms <= now_unix_ms)
             .map(profile_id_from_lease)
             .collect();
+        let changed = !expired_profile_ids.is_empty();
 
         state
             .leases
@@ -348,6 +386,7 @@ impl ControllerService {
                 profile.status = ProfileStatus::Available as i32;
             }
         }
+        changed
     }
 
     fn metric_key(sample: &MetricSample) -> MetricBucketKey {
@@ -408,6 +447,7 @@ impl GlobalController for ControllerService {
         for profile in request.profiles {
             Self::upsert_profile_and_bindings(&mut next_state, profile, &machine.machine_id, now)?;
         }
+        self.persist_state(&next_state)?;
         *state = next_state;
         self.network.upsert_machine(machine.clone());
 
@@ -443,6 +483,7 @@ impl GlobalController for ControllerService {
         for profile in request.profiles {
             Self::upsert_profile_and_bindings(&mut next_state, profile, &request.machine_id, now)?;
         }
+        self.persist_state(&next_state)?;
         *state = next_state;
         self.network.upsert_machine(machine);
 
@@ -474,8 +515,13 @@ impl GlobalController for ControllerService {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
         let mut state = self.state.write().expect("controller state lock poisoned");
-        Self::mark_expired_leases(&mut state, now);
-        let profiles = state
+        let mut next_state = state.clone();
+        let expired = Self::mark_expired_leases(&mut next_state, now);
+        if expired {
+            self.persist_state(&next_state)?;
+            *state = next_state.clone();
+        }
+        let profiles = next_state
             .profiles
             .values()
             .filter(|profile| {
@@ -499,11 +545,16 @@ impl GlobalController for ControllerService {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
         let mut state = self.state.write().expect("controller state lock poisoned");
-        Self::mark_expired_leases(&mut state, now);
-        let bindings = state
+        let mut next_state = state.clone();
+        let expired = Self::mark_expired_leases(&mut next_state, now);
+        if expired {
+            self.persist_state(&next_state)?;
+            *state = next_state.clone();
+        }
+        let bindings = next_state
             .account_bindings
             .values()
-            .filter_map(|binding| Self::live_binding(&state, binding))
+            .filter_map(|binding| Self::live_binding(&next_state, binding))
             .filter(|binding| Self::binding_matches(binding, &request))
             .collect();
         Ok(Response::new(ListBrowserAccountBindingsResponse {
@@ -523,10 +574,15 @@ impl GlobalController for ControllerService {
         }
         let now = self.clock.now_unix_ms();
         let mut state = self.state.write().expect("controller state lock poisoned");
-        Self::mark_expired_leases(&mut state, now);
-        let binding = Self::select_binding_for_lookup(&state, &request)
+        let mut next_state = state.clone();
+        let expired = Self::mark_expired_leases(&mut next_state, now);
+        if expired {
+            self.persist_state(&next_state)?;
+            *state = next_state.clone();
+        }
+        let binding = Self::select_binding_for_lookup(&next_state, &request)
             .ok_or_else(|| Status::not_found("no browser account binding matched request"))?;
-        let active_lease = Self::active_lease_for_profile(&state, &binding.profile_id);
+        let active_lease = Self::active_lease_for_profile(&next_state, &binding.profile_id);
         let available = binding.profile_status == ProfileStatus::Available as i32;
         let route_hint = BrowserRoute {
             machine_id: binding.machine_id.clone(),
@@ -570,8 +626,9 @@ impl GlobalController for ControllerService {
         let now = self.clock.now_unix_ms();
         let selected_profile = {
             let mut state = self.state.write().expect("controller state lock poisoned");
-            Self::mark_expired_leases(&mut state, now);
-            let profile = Self::select_profile_for_acquire(&state, &request)
+            let mut next_state = state.clone();
+            Self::mark_expired_leases(&mut next_state, now);
+            let profile = Self::select_profile_for_acquire(&next_state, &request)
                 .ok_or_else(|| Status::not_found("no available profile matched request"))?;
             let lease_id = self.ids.next_id("lease");
             let fencing_token = self.ids.next_id("fence");
@@ -589,10 +646,12 @@ impl GlobalController for ControllerService {
                 fencing_token: fencing_token.clone(),
                 expires_at_unix_ms: now + ttl_seconds * 1000,
             };
-            state.leases.insert(lease_id, lease.clone());
-            if let Some(stored_profile) = state.profiles.get_mut(&profile.profile_id) {
+            next_state.leases.insert(lease_id, lease.clone());
+            if let Some(stored_profile) = next_state.profiles.get_mut(&profile.profile_id) {
                 stored_profile.status = ProfileStatus::Leased as i32;
             }
+            self.persist_state(&next_state)?;
+            *state = next_state;
             (profile, lease)
         };
 
@@ -627,8 +686,9 @@ impl GlobalController for ControllerService {
         };
         let now = self.clock.now_unix_ms();
         let mut state = self.state.write().expect("controller state lock poisoned");
-        Self::mark_expired_leases(&mut state, now);
-        let lease = state
+        let mut next_state = state.clone();
+        Self::mark_expired_leases(&mut next_state, now);
+        let lease = next_state
             .leases
             .get_mut(&request.lease_id)
             .ok_or_else(|| Status::not_found("lease not found"))?;
@@ -636,9 +696,10 @@ impl GlobalController for ControllerService {
             return Err(Status::permission_denied("invalid fencing token"));
         }
         lease.expires_at_unix_ms = now + ttl_seconds * 1000;
-        Ok(Response::new(RenewLeaseResponse {
-            lease: Some(lease.clone()),
-        }))
+        let lease = lease.clone();
+        self.persist_state(&next_state)?;
+        *state = next_state;
+        Ok(Response::new(RenewLeaseResponse { lease: Some(lease) }))
     }
 
     async fn release_lease(
@@ -648,8 +709,9 @@ impl GlobalController for ControllerService {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
         let mut state = self.state.write().expect("controller state lock poisoned");
-        Self::mark_expired_leases(&mut state, now);
-        let lease = state
+        let mut next_state = state.clone();
+        Self::mark_expired_leases(&mut next_state, now);
+        let lease = next_state
             .leases
             .get(&request.lease_id)
             .ok_or_else(|| Status::not_found("lease not found"))?;
@@ -657,10 +719,12 @@ impl GlobalController for ControllerService {
             return Err(Status::permission_denied("invalid fencing token"));
         }
         let profile_id = lease.profile_id.clone();
-        state.leases.remove(&request.lease_id);
-        if let Some(profile) = state.profiles.get_mut(&profile_id) {
+        next_state.leases.remove(&request.lease_id);
+        if let Some(profile) = next_state.profiles.get_mut(&profile_id) {
             profile.status = ProfileStatus::Available as i32;
         }
+        self.persist_state(&next_state)?;
+        *state = next_state;
         Ok(Response::new(ReleaseLeaseResponse { released: true }))
     }
 
@@ -672,15 +736,21 @@ impl GlobalController for ControllerService {
         let lease = {
             let now = self.clock.now_unix_ms();
             let mut state = self.state.write().expect("controller state lock poisoned");
-            Self::mark_expired_leases(&mut state, now);
-            let lease = state
+            let mut next_state = state.clone();
+            let expired = Self::mark_expired_leases(&mut next_state, now);
+            let lease = next_state
                 .leases
                 .get(&request.lease_id)
                 .ok_or_else(|| Status::not_found("lease not found"))?;
             if lease.fencing_token != request.fencing_token {
                 return Err(Status::permission_denied("invalid fencing token"));
             }
-            lease.clone()
+            let lease = lease.clone();
+            if expired {
+                self.persist_state(&next_state)?;
+                *state = next_state;
+            }
+            lease
         };
         let endpoint = self
             .network
@@ -708,6 +778,7 @@ impl GlobalController for ControllerService {
         }
 
         let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut next_state = state.clone();
         let mut accepted_samples = 0;
         for mut sample in request.samples {
             if sample.name.is_empty() {
@@ -718,7 +789,7 @@ impl GlobalController for ControllerService {
             }
             sample.domain = sanitize_domain(&sample.domain);
             let key = Self::metric_key(&sample);
-            let point = state
+            let point = next_state
                 .metrics
                 .entry(key.clone())
                 .or_insert_with(|| Self::point_from_key(&key, 0.0));
@@ -731,9 +802,11 @@ impl GlobalController for ControllerService {
         }
 
         let accepted_events = request.events.len() as i32;
-        state
+        next_state
             .events
             .extend(request.events.into_iter().map(redact_event));
+        self.persist_state(&next_state)?;
+        *state = next_state;
         Ok(Response::new(ReportTelemetryResponse {
             accepted_samples,
             accepted_events,
@@ -804,6 +877,7 @@ impl GlobalController for ControllerService {
             return Err(Status::invalid_argument("reporter_machine_id is required"));
         }
         let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut next_state = state.clone();
         let mut accepted_artifacts = 0;
         for mut artifact in request.artifacts {
             if artifact.artifact_id.is_empty() {
@@ -812,11 +886,13 @@ impl GlobalController for ControllerService {
             if artifact.machine_id.is_empty() {
                 artifact.machine_id = request.reporter_machine_id.clone();
             }
-            state
+            next_state
                 .artifacts
                 .insert(artifact.artifact_id.clone(), artifact);
             accepted_artifacts += 1;
         }
+        self.persist_state(&next_state)?;
+        *state = next_state;
         Ok(Response::new(ReportArtifactsResponse {
             accepted_artifacts,
         }))
@@ -889,6 +965,145 @@ fn redact_event(mut event: ControlPlaneEvent) -> ControlPlaneEvent {
     event
 }
 
+fn init_store(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS controller_records (
+            kind TEXT NOT NULL,
+            id TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            PRIMARY KEY (kind, id)
+        );",
+    )?;
+    Ok(())
+}
+
+fn persist_state(conn: &mut Connection, state: &ControllerState) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    for kind in [
+        "machine", "profile", "binding", "lease", "metric", "event", "artifact",
+    ] {
+        tx.execute("DELETE FROM controller_records WHERE kind = ?1", [kind])?;
+    }
+
+    {
+        let mut stmt =
+            tx.prepare("INSERT INTO controller_records (kind, id, payload) VALUES (?1, ?2, ?3)")?;
+        for machine in state.machines.values() {
+            insert_message(&mut stmt, "machine", &machine.machine_id, machine)?;
+        }
+        for profile in state.profiles.values() {
+            insert_message(&mut stmt, "profile", &profile.profile_id, profile)?;
+        }
+        for binding in state.account_bindings.values() {
+            insert_message(&mut stmt, "binding", &binding.binding_id, binding)?;
+        }
+        for lease in state.leases.values() {
+            insert_message(&mut stmt, "lease", &lease.lease_id, lease)?;
+        }
+        for point in state.metrics.values() {
+            insert_message(&mut stmt, "metric", &metric_point_id(point), point)?;
+        }
+        for (index, event) in state.events.iter().enumerate() {
+            let id = if event.event_id.is_empty() {
+                format!("{}:{index}", event.observed_at_unix_ms)
+            } else {
+                event.event_id.clone()
+            };
+            insert_message(&mut stmt, "event", &id, event)?;
+        }
+        for artifact in state.artifacts.values() {
+            insert_message(&mut stmt, "artifact", &artifact.artifact_id, artifact)?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn insert_message<M: Message>(
+    stmt: &mut rusqlite::Statement<'_>,
+    kind: &str,
+    id: &str,
+    message: &M,
+) -> anyhow::Result<()> {
+    stmt.execute(params![kind, id, message.encode_to_vec()])?;
+    Ok(())
+}
+
+fn load_state(conn: &Connection) -> anyhow::Result<ControllerState> {
+    let mut state = ControllerState::default();
+
+    for machine in load_messages::<Machine>(conn, "machine")? {
+        state.machines.insert(machine.machine_id.clone(), machine);
+    }
+    for lease in load_messages::<BrowserLease>(conn, "lease")? {
+        state.leases.insert(lease.lease_id.clone(), lease);
+    }
+    for profile in load_messages::<BrowserProfile>(conn, "profile")? {
+        state.profiles.insert(profile.profile_id.clone(), profile);
+    }
+    for binding in load_messages::<BrowserAccountBinding>(conn, "binding")? {
+        if let Some(key) =
+            ControllerService::account_binding_key(binding.platform, &binding.account_id)
+        {
+            state.account_bindings.insert(key, binding);
+        }
+    }
+    for point in load_messages::<MetricPoint>(conn, "metric")? {
+        state.metrics.insert(metric_key_from_point(&point), point);
+    }
+    state.events = load_messages::<ControlPlaneEvent>(conn, "event")?;
+    for artifact in load_messages::<Artifact>(conn, "artifact")? {
+        state
+            .artifacts
+            .insert(artifact.artifact_id.clone(), artifact);
+    }
+
+    Ok(state)
+}
+
+fn load_messages<M: Message + Default>(conn: &Connection, kind: &str) -> anyhow::Result<Vec<M>> {
+    let mut stmt =
+        conn.prepare("SELECT payload FROM controller_records WHERE kind = ?1 ORDER BY id ASC")?;
+    let rows = stmt.query_map([kind], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let payload = row?;
+        messages.push(M::decode(payload.as_slice())?);
+    }
+    Ok(messages)
+}
+
+fn metric_key_from_point(point: &MetricPoint) -> MetricBucketKey {
+    MetricBucketKey {
+        name: point.name.clone(),
+        bucket_start_unix_ms: point.bucket_start_unix_ms,
+        machine_id: point.machine_id.clone(),
+        profile_id: point.profile_id.clone(),
+        platform: point.platform,
+        domain: point.domain.clone(),
+        action: point.action.clone(),
+        status_class: point.status_class.clone(),
+        error_class: point.error_class.clone(),
+    }
+}
+
+fn metric_point_id(point: &MetricPoint) -> String {
+    let key = metric_key_from_point(point);
+    [
+        key.name,
+        key.bucket_start_unix_ms.to_string(),
+        key.machine_id,
+        key.profile_id,
+        key.platform.to_string(),
+        key.domain,
+        key.action,
+        key.status_class,
+        key.error_class,
+    ]
+    .join("\u{1f}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -916,6 +1131,18 @@ mod tests {
             Arc::new(StaticNetworkDirectory::default()),
         );
         (service, clock)
+    }
+
+    fn sqlite_test_service(path: &std::path::Path) -> ControllerService {
+        ControllerService::new_with_sqlite(
+            path,
+            Arc::new(FakeClock::new(1_000)),
+            Arc::new(FakeIdGenerator::new([
+                "lease_1", "fence_1", "lease_2", "fence_2",
+            ])),
+            Arc::new(StaticNetworkDirectory::default()),
+        )
+        .unwrap()
     }
 
     fn machine() -> Machine {
@@ -1010,6 +1237,100 @@ mod tests {
         assert_eq!(binding.profile_status, ProfileStatus::Available as i32);
         assert_eq!(binding.agent_grpc_addr, "http://machine-a.tail.test:7100");
         assert_eq!(binding.last_seen_unix_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_restores_registered_account_bindings() {
+        // Arrange
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("controller.sqlite");
+        let service = sqlite_test_service(&db_path);
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(machine()),
+                profiles: vec![profile()],
+            }))
+            .await
+            .unwrap();
+        drop(service);
+
+        // Act
+        let restored = sqlite_test_service(&db_path);
+        let response = restored
+            .lookup_browser_connection(Request::new(LookupBrowserConnectionRequest {
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "yt-1".to_string(),
+                label_selector: HashMap::new(),
+                include_unavailable: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Assert
+        let binding = response.binding.unwrap();
+        let route = response.route_hint.unwrap();
+        assert_eq!(binding.profile_id, "youtube-main");
+        assert_eq!(binding.machine_id, "machine-a");
+        assert_eq!(route.agent_grpc_addr, "http://machine-a.tail.test:7100");
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_restores_active_lease_state() {
+        // Arrange
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("controller.sqlite");
+        let service = sqlite_test_service(&db_path);
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(machine()),
+                profiles: vec![profile()],
+            }))
+            .await
+            .unwrap();
+        let lease = service
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "client-1".to_string(),
+                purpose: "upload".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "yt-1".to_string(),
+                label_selector: HashMap::new(),
+                ttl_seconds: 60,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+        drop(service);
+
+        // Act
+        let restored = sqlite_test_service(&db_path);
+        let response = restored
+            .lookup_browser_connection(Request::new(LookupBrowserConnectionRequest {
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "yt-1".to_string(),
+                label_selector: HashMap::new(),
+                include_unavailable: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let second_acquire = restored
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "client-2".to_string(),
+                purpose: "upload".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "yt-1".to_string(),
+                label_selector: HashMap::new(),
+                ttl_seconds: 60,
+            }))
+            .await;
+
+        // Assert
+        assert!(!response.available);
+        assert_eq!(response.active_lease_id, lease.lease_id);
+        assert_eq!(second_acquire.unwrap_err().code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

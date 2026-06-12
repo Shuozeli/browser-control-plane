@@ -53,18 +53,25 @@ browser host B:
   Chrome profiles
 ```
 
-## Known Current Limitation
+## Registration And State
 
-`bcp-agent` does not yet auto-register itself with the global controller.
+`bcp-agent` auto-registers itself when `BCP_CONTROLLER` is set. It reports the
+machine id, public agent gRPC address, labels, and current browser profiles.
+The loop repeats on `BCP_CONTROLLER_REGISTER_SECONDS`, defaulting to 10 seconds.
 
 If `bcp-client machines` returns `0`, first determine whether registration
-happened. Do not immediately report a network bug.
+happened. Do not immediately report a network bug. Check:
 
-Current registration paths:
+- Is `BCP_CONTROLLER` set in the agent environment?
+- Does the agent log show controller registration errors?
+- Does `BCP_AGENT_PUBLIC_ADDR` or `TAILSCALE_HOST` point to a client-reachable
+  address?
+- Does the agent have profiles from `BCP_REAL_PROFILES`, `BCP_E2E_*`, or
+  `BCP_AGENT_DB`?
 
-- Docker E2E client registers machines explicitly.
-- A bootstrap gRPC client can call `RegisterMachine`.
-- Future work should add native agent auto-registration.
+Durable state is SQLite-backed. The global controller uses
+`BCP_CONTROLLER_DB` or `.bcp/controller.sqlite`; the machine controller uses
+`BCP_AGENT_DB` or `.bcp/agent.sqlite`.
 
 ## Fast Exploration Checklist
 
@@ -92,7 +99,7 @@ Docker can pull `chromedp/headless-shell`.
 ### Single Host
 
 1. Start `bcp-controller`.
-2. Start `bcp-agent`.
+2. Start `bcp-agent` with `BCP_CONTROLLER=http://<controller-host>:7000`.
 3. Confirm registration has occurred.
 4. Run:
 
@@ -139,6 +146,7 @@ Symptoms:
 Check:
 
 - Did `RegisterMachine` run?
+- Is `BCP_CONTROLLER` configured on the agent?
 - Does `BrowserProfile.machine_id` match the reporting `Machine.machine_id`?
 - Does `Machine.agent_grpc_addr` point to the machine controller MagicDNS URL?
 - Are `Account.platform` and `Account.account_id` exactly what lookup uses?

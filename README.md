@@ -64,13 +64,17 @@ cargo run --release -p bcp-client -- lookup --platform youtube --account-id yt-1
 ```
 
 Server binaries bind to `$TAILSCALE_IP` when it is set, otherwise `0.0.0.0`.
-Machine artifact storage is controlled by `BCP_ARTIFACT_DIR`,
-`BCP_ARTIFACT_MAX_TTL_SECONDS`, and `BCP_ARTIFACT_CLEANUP_SECONDS`.
+All durable control-plane state is SQLite-backed by default. The global
+controller stores fleet state in `BCP_CONTROLLER_DB` or `.bcp/controller.sqlite`;
+each machine controller stores local profile state in `BCP_AGENT_DB` or
+`.bcp/agent.sqlite`. Machine artifact storage is controlled by
+`BCP_ARTIFACT_DIR`, `BCP_ARTIFACT_MAX_TTL_SECONDS`, and
+`BCP_ARTIFACT_CLEANUP_SECONDS`.
 
 For deployment, start with the single-computer path in
-[Deployment](docs/deployment.md). It also documents the current production gap:
-`bcp-agent` does not yet auto-register with the global controller, so real
-deployments need a bootstrap registration step until that feature is added.
+[Deployment](docs/deployment.md). `bcp-agent` auto-registers with the global
+controller when `BCP_CONTROLLER` is set, so the common one-machine deployment
+only needs the controller and agent processes.
 
 ## Documentation
 

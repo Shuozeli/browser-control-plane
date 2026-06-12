@@ -11,7 +11,7 @@
 
 ## Phase 1: Local Machine Controller
 
-- [ ] Add local SQLite state.
+- [x] Add local SQLite state.
 - [ ] Add profile config file format.
 - [ ] Implement local profile discovery.
 - [ ] Implement CDP port allocation.
@@ -21,14 +21,15 @@
 
 ## Phase 2: Global Controller
 
-- [ ] Add Postgres storage.
-- [ ] Implement machine registration.
+- [x] Add SQLite controller storage.
+- [x] Implement machine registration.
 - [ ] Implement heartbeat ingestion.
 - [ ] Implement profile/account registry updates.
 - [ ] Implement profile selection.
 - [ ] Implement lease grant, renewal, expiration, and release.
 - [ ] Implement route lookup.
-- [ ] Add agent auto-registration and controller heartbeat reporting.
+- [x] Add agent auto-registration.
+- [ ] Add richer controller heartbeat reporting.
 
 ## Phase 3: Browser Proxy
 

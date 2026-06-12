@@ -80,6 +80,10 @@ impl BrowserFleetManager {
             });
     }
 
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
     pub fn list_profiles(&self) -> Vec<BrowserProfile> {
         self.browsers
             .read()

@@ -68,6 +68,14 @@ impl AgentService {
         self.fleet.upsert_desired_profile(profile);
     }
 
+    pub fn machine_id(&self) -> String {
+        self.fleet.machine_id().to_string()
+    }
+
+    pub fn list_profiles(&self) -> Vec<BrowserProfile> {
+        self.fleet.list_profiles()
+    }
+
     pub async fn reconcile_fleet_once(&self) {
         self.fleet.reconcile_once().await;
     }

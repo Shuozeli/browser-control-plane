@@ -8,14 +8,18 @@ single-computer case and for a multi-computer fleet.
 The controller and machine controller binaries are runnable today. The Docker
 E2E suites also exercise the routing path end to end.
 
-One production feature is still missing: `bcp-agent` does not yet
-automatically register itself with the global controller. Current E2E tests
-perform registration from the test client. Until agent auto-registration is
-implemented, a real deployment must register machines/profiles through the
-global gRPC API or through a small bootstrap client.
+All control-plane persistence uses SQLite by default:
 
-Do not treat an empty `bcp-client machines` result as a networking failure
-until registration has been checked.
+- `bcp-controller` stores global fleet state in `BCP_CONTROLLER_DB`, or
+  `.bcp/controller.sqlite` when unset.
+- `bcp-agent` stores local profile state in `BCP_AGENT_DB`, or
+  `.bcp/agent.sqlite` when unset.
+- Uploaded artifact metadata is stored in `artifacts.sqlite` under
+  `BCP_ARTIFACT_DIR`.
+
+`bcp-agent` auto-registers with the global controller when `BCP_CONTROLLER` is
+set. Do not treat an empty `bcp-client machines` result as a networking failure
+until the agent logs and `BCP_CONTROLLER` value have been checked.
 
 ## Ports And Processes
 
@@ -77,6 +81,12 @@ $env:TAILSCALE_IP = tailscale ip -4
 cargo run --release -p bcp-controller -- --addr "$env:TAILSCALE_IP`:7000"
 ```
 
+Optional durable path override:
+
+```bash
+export BCP_CONTROLLER_DB=$HOME/.local/share/bcp/controller.sqlite
+```
+
 ### 3. Start One Machine Controller
 
 For a fake/recording profile, useful for local smoke tests:
@@ -87,6 +97,7 @@ export BCP_E2E_PROFILE_ID=youtube-main
 export BCP_E2E_ACCOUNT_ID=yt-main
 export BCP_E2E_PLATFORM=youtube
 export BCP_ARTIFACT_DIR=$HOME/.local/share/bcp/artifacts
+export BCP_CONTROLLER=http://${TAILSCALE_HOST:-127.0.0.1}:7000
 cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100
 ```
 
@@ -95,6 +106,7 @@ For real Chrome/CDP profiles, use `BCP_REAL_PROFILES`:
 ```bash
 export BCP_MACHINE_ID=$(hostname)
 export BCP_REAL_PROFILES='yt-main|yt-main|youtube|http://100.64.0.10:9222|https://studio.youtube.com'
+export BCP_CONTROLLER=http://${TAILSCALE_HOST:-127.0.0.1}:7000
 cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100
 ```
 
@@ -107,24 +119,24 @@ profile_id|account_id|platform|cdp_url|initial_url;profile_id2|account_id2|platf
 Supported platform names: `youtube`, `x`, `douyin`, `tiktok`, `reddit`,
 `zhihu`, `weibo`.
 
-### 4. Register The Machine
+Optional durable path override:
 
-Current limitation: the machine controller does not auto-register with the
-global controller yet.
+```bash
+export BCP_AGENT_DB=$HOME/.local/share/bcp/agent.sqlite
+```
 
-For now, use one of these paths:
+### 4. Confirm Auto-Registration
 
-- Run the Docker E2E harness, which registers machines before testing routes.
-- Use a small gRPC bootstrap client that calls `RegisterMachine`.
-- Add auto-registration to `bcp-agent` before using this as a persistent
-  production deployment.
-
-The registration data must include:
+When `BCP_CONTROLLER` is set, `bcp-agent` periodically sends `RegisterMachine`
+to the global controller with:
 
 - `Machine.machine_id`
-- `Machine.agent_grpc_addr`, using the Tailscale MagicDNS URL, for example
+- `Machine.agent_grpc_addr`, preferably a Tailscale MagicDNS URL such as
   `http://my-host.tailnet.ts.net:7100`
-- One or more `BrowserProfile` records with `accounts`
+- the current local `BrowserProfile` records and accounts
+
+Use `BCP_AGENT_PUBLIC_ADDR` when the address clients should use is different
+from the bind address.
 
 ### 5. Verify Lookup
 
@@ -204,17 +216,17 @@ On every browser host:
 
 ```bash
 export TAILSCALE_IP=$(tailscale ip -4)
+export TAILSCALE_HOST=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.$//')
 export BCP_MACHINE_ID=$(hostname)
 export BCP_ARTIFACT_DIR=$HOME/.local/share/bcp/artifacts
 export BCP_REAL_PROFILES='yt-main|yt-main|youtube|http://100.64.0.20:9222|https://studio.youtube.com'
+export BCP_CONTROLLER=http://<controller-magicdns-name>:7000
+export BCP_AGENT_PUBLIC_ADDR=http://$TAILSCALE_HOST:7100
 cargo run --release -p bcp-agent -- --addr $TAILSCALE_IP:7100
 ```
 
-Register each machine in the global controller with its MagicDNS address:
-
-```text
-agent_grpc_addr = http://<machine-magicdns-name>:7100
-```
+The agent registers itself with `agent_grpc_addr =
+http://<machine-magicdns-name>:7100`.
 
 ### 4. Verify Fleet Routing
 
@@ -262,7 +274,11 @@ fetches `pwright-bridge` from the `Shuozeli/pwright` git dependency.
 | --- | --- | --- |
 | `TAILSCALE_IP` | controller, agent | Bind address host |
 | `BCP_CONTROLLER_ADDR` | controller | Explicit global controller bind address |
+| `BCP_CONTROLLER_DB` | controller | SQLite path for global fleet state |
 | `BCP_AGENT_ADDR` | agent | Explicit machine controller bind address |
+| `BCP_AGENT_DB` | agent | SQLite path for local profile state |
+| `BCP_AGENT_PUBLIC_ADDR` | agent | Public machine-controller URL reported to the global controller |
+| `BCP_AGENT_GRPC_ADDR` | agent | Fallback public machine-controller URL |
 | `BCP_CONTROLLER` | client, E2E | Global controller endpoint |
 | `BCP_MACHINE_ID` | agent | Machine identity for local profiles |
 | `BCP_E2E_PROFILE_ID` | agent | Fake profile id for recording gateway |
@@ -270,14 +286,14 @@ fetches `pwright-bridge` from the `Shuozeli/pwright` git dependency.
 | `BCP_E2E_PLATFORM` | agent | Fake account platform |
 | `BCP_REAL_PROFILES` | agent | Real CDP profile mapping |
 | `BCP_BROWSER_HEARTBEAT_SECONDS` | agent | Local fleet reconcile interval |
+| `BCP_CONTROLLER_REGISTER_SECONDS` | agent | Agent auto-registration interval |
 | `BCP_ARTIFACT_DIR` | agent | Dedicated local artifact directory |
 | `BCP_ARTIFACT_MAX_TTL_SECONDS` | agent | Max accepted upload TTL |
 | `BCP_ARTIFACT_CLEANUP_SECONDS` | agent | Artifact cleanup scan interval |
 
 ## Production Gaps To Track
 
-- Agent auto-registration and heartbeat reporting to the global controller.
-- Persistent global controller storage.
 - Service manager examples for systemd, launchd, and Windows services.
+- Richer controller-to-agent health heartbeat reporting beyond registration refresh.
 - Authn/authz for controller and machine-controller APIs.
 - TLS or mesh-level policy for gRPC traffic.
