@@ -14,6 +14,7 @@ use tokio::process::{Child, Command};
 async fn main() -> anyhow::Result<()> {
     match std::env::var("BCP_E2E_MODE").as_deref() {
         Ok("real-browser") => real_browser_main().await,
+        Ok("real-web-wsj") => real_web_wsj_main().await,
         Ok("sqlite-persistence") => sqlite_persistence_main().await,
         _ => recording_main().await,
     }
@@ -426,6 +427,145 @@ async fn real_browser_main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn real_web_wsj_main() -> anyhow::Result<()> {
+    let controller =
+        std::env::var("BCP_CONTROLLER").unwrap_or_else(|_| "http://controller:7000".to_string());
+    let mut global = connect_global(&controller).await?;
+
+    for machine in ["a", "b", "c"] {
+        let machine_id = format!("machine-{machine}");
+        let agent_addr = format!("http://agent-{machine}:7100");
+        let profiles = (1..=3)
+            .map(|index| {
+                real_profile(
+                    &format!("wsj-{machine}-{index}"),
+                    &machine_id,
+                    AccountPlatform::Wsj,
+                    &format!("wsj-{machine}-{index}"),
+                    &format!("http://172.31.{}.1{index}:9222", machine_octet(machine)),
+                )
+            })
+            .collect();
+        register_machine_with_profiles(&mut global, &machine_id, &agent_addr, profiles).await?;
+    }
+
+    let mut all_headlines = Vec::new();
+    for machine in ["a", "b", "c"] {
+        for index in 1..=3 {
+            let account_id = format!("wsj-{machine}-{index}");
+            let headlines = exercise_wsj_profile(&mut global, &account_id).await?;
+            println!(
+                "wsj headlines via {account_id}: {}",
+                headlines
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            all_headlines.extend(headlines);
+        }
+    }
+
+    all_headlines.sort();
+    all_headlines.dedup();
+    if all_headlines.len() < 5 {
+        bail!(
+            "expected at least five unique WSJ headline-like texts, got {}",
+            all_headlines.len()
+        );
+    }
+
+    println!(
+        "docker wsj e2e passed: collected {} unique headline-like texts across 9 browsers",
+        all_headlines.len()
+    );
+    Ok(())
+}
+
+async fn exercise_wsj_profile(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    account_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "docker-wsj-e2e".to_string(),
+            purpose: "collect-wsj-headlines".to_string(),
+            platform: AccountPlatform::Wsj as i32,
+            account_id: account_id.to_string(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 120,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("controller did not return route")?;
+    let lease = acquired.lease.context("controller did not return lease")?;
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .ensure_browser(EnsureBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+
+    let raw = agent
+        .evaluate(EvaluateRequest {
+            lease: Some(lease_context),
+            expression: wsj_headline_expression(),
+        })
+        .await?
+        .into_inner()
+        .json_result;
+    let extraction: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse WSJ extraction JSON from {account_id}: {raw}"))?;
+    let href = extraction
+        .get("href")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let title = extraction
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let block_signal = extraction
+        .get("blockSignal")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let blocked = extraction
+        .get("blocked")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if blocked {
+        bail!(
+            "WSJ blocked headless Docker browser for {account_id}; href={href}; title={title}; block_signal={block_signal}"
+        );
+    }
+
+    let headlines = extraction
+        .get("headlines")
+        .and_then(|value| value.as_array())
+        .context("WSJ extraction did not include a headlines array")?
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    if headlines.len() < 3 {
+        bail!(
+            "expected at least three headline-like texts from {account_id}, got {}; href={href}; title={title}; headlines={:?}",
+            headlines.len(),
+            headlines
+        );
+    }
+    Ok(headlines)
+}
+
 async fn exercise_real_profile(
     global: &mut GlobalControllerClient<tonic::transport::Channel>,
     platform: AccountPlatform,
@@ -522,6 +662,58 @@ async fn exercise_real_profile(
         Ok(_) => bail!("wrong real-browser agent accepted a lease that was never installed"),
     }
     Ok(())
+}
+
+fn machine_octet(machine: &str) -> i32 {
+    match machine {
+        "a" => 10,
+        "b" => 20,
+        "c" => 30,
+        _ => 40,
+    }
+}
+
+fn wsj_headline_expression() -> String {
+    r#"
+(() => {
+  const selectors = [
+    "h1", "h2", "h3",
+    "[data-testid*='headline']",
+    "[class*='headline']",
+    "article a",
+    "main a"
+  ];
+  const href = window.location.href;
+  const title = document.title || "";
+  const bodyText = (document.body && document.body.innerText || "").slice(0, 5000);
+  const resourceUrls = performance.getEntriesByType("resource")
+    .map((entry) => entry.name || "")
+    .filter(Boolean);
+  const scriptUrls = Array.from(document.scripts)
+    .map((script) => script.src || "")
+    .filter(Boolean);
+  const blockSignal = [href, title, bodyText, ...resourceUrls, ...scriptUrls]
+    .find((value) => /captcha|datadome|captcha-delivery/i.test(value)) || "";
+  const blocked =
+    blockSignal.length > 0 ||
+    /verify you are human|are you a robot/i.test(bodyText) ||
+    window.location.hostname.includes("captcha-delivery.com");
+  const seen = new Set();
+  const headlines = [];
+  for (const el of document.querySelectorAll(selectors.join(","))) {
+    const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    if (text.length < 20 || text.length > 220) continue;
+    if (/^(subscribe|sign in|log in|advertisement|skip to|menu)$/i.test(text)) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    headlines.push(text);
+    if (headlines.length >= 30) break;
+  }
+  return JSON.stringify({ href, title, blocked, blockSignal, headlines });
+})()
+"#
+    .to_string()
 }
 
 fn spawn_controller(addr: &str, db_path: &Path) -> anyhow::Result<Child> {

@@ -1,0 +1,181 @@
+x-bcp-build: &bcp-build
+  context: ../..
+  dockerfile: Dockerfile.e2e
+
+services:
+  controller:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-controller
+    command:
+      - --addr
+      - 0.0.0.0:7000
+    networks:
+      control-net:
+        aliases:
+          - controller
+
+  chrome-a1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.11
+  chrome-a2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.12
+  chrome-a3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.13
+
+  chrome-b1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.11
+  chrome-b2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.12
+  chrome-b3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.13
+
+  chrome-c1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.31.30.11
+  chrome-c2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.31.30.12
+  chrome-c3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.31.30.13
+
+  agent-a:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-a
+      BCP_REAL_PROFILES: >-
+        wsj-a-1|wsj-a-1|wsj|http://172.31.10.11:9222|https://www.wsj.com/;
+        wsj-a-2|wsj-a-2|wsj|http://172.31.10.12:9222|https://www.wsj.com/;
+        wsj-a-3|wsj-a-3|wsj|http://172.31.10.13:9222|https://www.wsj.com/
+    depends_on:
+      - chrome-a1
+      - chrome-a2
+      - chrome-a3
+    networks:
+      control-net:
+        aliases:
+          - agent-a
+      machine-a-net:
+
+  agent-b:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-b
+      BCP_REAL_PROFILES: >-
+        wsj-b-1|wsj-b-1|wsj|http://172.31.20.11:9222|https://www.wsj.com/;
+        wsj-b-2|wsj-b-2|wsj|http://172.31.20.12:9222|https://www.wsj.com/;
+        wsj-b-3|wsj-b-3|wsj|http://172.31.20.13:9222|https://www.wsj.com/
+    depends_on:
+      - chrome-b1
+      - chrome-b2
+      - chrome-b3
+    networks:
+      control-net:
+        aliases:
+          - agent-b
+      machine-b-net:
+
+  agent-c:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-c
+      BCP_REAL_PROFILES: >-
+        wsj-c-1|wsj-c-1|wsj|http://172.31.30.11:9222|https://www.wsj.com/;
+        wsj-c-2|wsj-c-2|wsj|http://172.31.30.12:9222|https://www.wsj.com/;
+        wsj-c-3|wsj-c-3|wsj|http://172.31.30.13:9222|https://www.wsj.com/
+    depends_on:
+      - chrome-c1
+      - chrome-c2
+      - chrome-c3
+    networks:
+      control-net:
+        aliases:
+          - agent-c
+      machine-c-net:
+
+  e2e-client:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-e2e
+    environment:
+      BCP_CONTROLLER: http://controller:7000
+      BCP_E2E_MODE: real-web-wsj
+    depends_on:
+      - controller
+      - agent-a
+      - agent-b
+      - agent-c
+    networks:
+      control-net:
+
+networks:
+  control-net:
+    name: browser-control-plane-wsj-control
+  machine-a-net:
+    name: browser-control-plane-wsj-machine-a
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24
+  machine-b-net:
+    name: browser-control-plane-wsj-machine-b
+    ipam:
+      config:
+        - subnet: 172.31.20.0/24
+  machine-c-net:
+    name: browser-control-plane-wsj-machine-c
+    ipam:
+      config:
+        - subnet: 172.31.30.0/24

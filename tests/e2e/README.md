@@ -47,9 +47,23 @@ SQLite persistence topology:
 - Verify the restored controller can return the active lease route and lookup
   state.
 
+WSJ real-web topology:
+
+- Start one global controller.
+- Start three machine-controller containers.
+- Start three real Chrome/CDP containers per machine, nine browsers total.
+- Register WSJ browser profiles in the global controller.
+- Acquire each profile through the controller and route browser work through the
+  matching machine controller.
+- Navigate to `https://www.wsj.com/` and extract visible headline-like text.
+- This is a manual external-network smoke test. It is intentionally not part of
+  default CI because WSJ availability, bot checks, geography, and page structure
+  can change outside this repository.
+
 ## Running
 
 ```bash
 docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit
 docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
+docker compose -f tests/e2e/docker-compose.wsj.yml up --build --abort-on-container-exit --exit-code-from e2e-client
 ```

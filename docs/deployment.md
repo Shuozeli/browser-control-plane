@@ -117,7 +117,7 @@ profile_id|account_id|platform|cdp_url|initial_url;profile_id2|account_id2|platf
 ```
 
 Supported platform names: `youtube`, `x`, `douyin`, `tiktok`, `reddit`,
-`zhihu`, `weibo`.
+`zhihu`, `weibo`, `wsj`.
 
 For persistent deployments, prefer a TOML config file over env profile strings:
 
@@ -338,6 +338,16 @@ docker compose -f tests/e2e/docker-compose.real-browser.yml down
 
 The real-browser image enables the `bcp-agent/real-pwright` Cargo feature and
 fetches `pwright-bridge` from the `Shuozeli/pwright` git dependency.
+
+Manual real-web WSJ topology with three machine controllers and nine Chrome
+instances:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.wsj.yml up --build --abort-on-container-exit --exit-code-from e2e-client
+docker compose -f tests/e2e/docker-compose.wsj.yml down
+```
+
+This is an external-network smoke test, not a deterministic CI test.
 
 ## Environment Variables
 

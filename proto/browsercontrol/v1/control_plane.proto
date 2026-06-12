@@ -69,6 +69,7 @@ enum AccountPlatform {
   ACCOUNT_PLATFORM_REDDIT = 5;
   ACCOUNT_PLATFORM_ZHIHU = 6;
   ACCOUNT_PLATFORM_WEIBO = 7;
+  ACCOUNT_PLATFORM_WSJ = 8;
 }
 
 enum MetricKind {
