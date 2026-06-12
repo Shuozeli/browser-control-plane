@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 pub struct AgentConfig {
     pub machine_id: String,
     pub gateway: GatewayKind,
+    pub cdp: CdpConfig,
     pub labels: HashMap<String, String>,
     pub profiles: Vec<ProfileConfig>,
 }
@@ -19,6 +21,14 @@ pub struct AgentConfig {
 pub enum GatewayKind {
     Recording,
     RealPwright,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CdpConfig {
+    pub host: String,
+    pub start_port: i32,
+    pub end_port: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,6 +66,9 @@ pub struct LifecycleConfig {
     pub launch_command: Vec<String>,
     pub working_dir: String,
     pub env: HashMap<String, String>,
+    pub readiness_url: String,
+    #[serde(default = "default_readiness_timeout_ms")]
+    pub readiness_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +83,19 @@ impl Default for AgentConfig {
         Self {
             machine_id: default_machine_id(),
             gateway: GatewayKind::Recording,
+            cdp: CdpConfig::default(),
             labels: HashMap::new(),
             profiles: Vec::new(),
+        }
+    }
+}
+
+impl Default for CdpConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            start_port: 9222,
+            end_port: 9322,
         }
     }
 }
@@ -143,11 +167,12 @@ pub fn parse_agent_config(raw: &str) -> anyhow::Result<AgentConfig> {
 }
 
 pub fn discover_profiles(config: &AgentConfig) -> anyhow::Result<Vec<DiscoveredProfile>> {
-    config
-        .profiles
-        .iter()
-        .map(|profile| profile.discover(&config.machine_id))
-        .collect()
+    let mut allocator = PortAllocator::new(config.cdp.clone())?;
+    let mut profiles = Vec::new();
+    for profile in &config.profiles {
+        profiles.push(profile.discover(&config.machine_id, &mut allocator)?);
+    }
+    Ok(profiles)
 }
 
 fn validate_agent_config(config: &AgentConfig) -> anyhow::Result<()> {
@@ -156,6 +181,12 @@ fn validate_agent_config(config: &AgentConfig) -> anyhow::Result<()> {
     }
     if config.profiles.is_empty() {
         bail!("at least one [[profiles]] entry is required");
+    }
+    if config.cdp.start_port <= 0 || config.cdp.end_port <= 0 {
+        bail!("cdp port range must be positive");
+    }
+    if config.cdp.start_port > config.cdp.end_port {
+        bail!("cdp start_port must be <= end_port");
     }
     for profile in &config.profiles {
         profile.validate()?;
@@ -197,15 +228,25 @@ impl ProfileConfig {
         Ok(())
     }
 
-    fn discover(&self, machine_id: &str) -> anyhow::Result<DiscoveredProfile> {
-        let cdp_url = if self.cdp_url.trim().is_empty() {
-            String::new()
+    fn discover(
+        &self,
+        machine_id: &str,
+        allocator: &mut PortAllocator,
+    ) -> anyhow::Result<DiscoveredProfile> {
+        let (cdp_url, cdp_port) = if !self.cdp_url.trim().is_empty() {
+            let port = self
+                .cdp_port
+                .or_else(|| parse_cdp_port(&self.cdp_url))
+                .unwrap_or_default();
+            allocator.reserve(port);
+            (self.cdp_url.clone(), port)
+        } else if let Some(port) = self.cdp_port {
+            allocator.reserve(port);
+            (format!("http://{}:{port}", allocator.host()), port)
         } else {
-            self.cdp_url.clone()
+            let port = allocator.allocate()?;
+            (format!("http://{}:{port}", allocator.host()), port)
         };
-        let cdp_port = self
-            .cdp_port
-            .unwrap_or_else(|| parse_cdp_port(&cdp_url).unwrap_or_default());
         let mut labels = self.labels.clone();
         if self.lifecycle.is_some() {
             labels.insert("bcp.lifecycle".to_string(), "managed".to_string());
@@ -226,10 +267,14 @@ impl ProfileConfig {
             labels,
             last_seen_unix_ms: 0,
         };
+        let lifecycle = self
+            .lifecycle
+            .clone()
+            .map(|lifecycle| render_lifecycle(lifecycle, &profile));
         Ok(DiscoveredProfile {
             profile,
             initial_url: self.initial_url.clone(),
-            lifecycle: self.lifecycle.clone(),
+            lifecycle,
         })
     }
 
@@ -298,8 +343,89 @@ fn parse_cdp_port(cdp_url: &str) -> Option<i32> {
         .and_then(|(_, port)| port.parse::<i32>().ok())
 }
 
+struct PortAllocator {
+    config: CdpConfig,
+    used: HashSet<i32>,
+}
+
+impl PortAllocator {
+    fn new(config: CdpConfig) -> anyhow::Result<Self> {
+        if config.start_port > config.end_port {
+            bail!("cdp start_port must be <= end_port");
+        }
+        Ok(Self {
+            config,
+            used: HashSet::new(),
+        })
+    }
+
+    fn host(&self) -> &str {
+        &self.config.host
+    }
+
+    fn reserve(&mut self, port: i32) {
+        if port > 0 {
+            self.used.insert(port);
+        }
+    }
+
+    fn allocate(&mut self) -> anyhow::Result<i32> {
+        for port in self.config.start_port..=self.config.end_port {
+            if self.used.contains(&port) {
+                continue;
+            }
+            if is_port_available(&self.config.host, port) {
+                self.used.insert(port);
+                return Ok(port);
+            }
+        }
+        bail!(
+            "no available CDP port in {}:{}-{}",
+            self.config.host,
+            self.config.start_port,
+            self.config.end_port
+        )
+    }
+}
+
+fn is_port_available(host: &str, port: i32) -> bool {
+    TcpListener::bind((host, port as u16)).is_ok()
+}
+
+fn render_lifecycle(mut lifecycle: LifecycleConfig, profile: &BrowserProfile) -> LifecycleConfig {
+    lifecycle.launch_command = lifecycle
+        .launch_command
+        .into_iter()
+        .map(|value| render_profile_template(&value, profile))
+        .collect();
+    lifecycle.working_dir = render_profile_template(&lifecycle.working_dir, profile);
+    lifecycle.env = lifecycle
+        .env
+        .into_iter()
+        .map(|(key, value)| (key, render_profile_template(&value, profile)))
+        .collect();
+    if lifecycle.readiness_url.trim().is_empty() {
+        lifecycle.readiness_url = profile.cdp_url.clone();
+    } else {
+        lifecycle.readiness_url = render_profile_template(&lifecycle.readiness_url, profile);
+    }
+    lifecycle
+}
+
+fn render_profile_template(value: &str, profile: &BrowserProfile) -> String {
+    value
+        .replace("{profile_id}", &profile.profile_id)
+        .replace("{profile_path}", &profile.profile_path)
+        .replace("{cdp_url}", &profile.cdp_url)
+        .replace("{cdp_port}", &profile.cdp_port.to_string())
+}
+
 fn default_machine_id() -> String {
     std::env::var("BCP_MACHINE_ID").unwrap_or_else(|_| "local-machine".to_string())
+}
+
+fn default_readiness_timeout_ms() -> u64 {
+    30_000
 }
 
 #[cfg(test)]
@@ -312,6 +438,11 @@ mod tests {
         let raw = r#"
 machine_id = "mac-mini-1"
 gateway = "recording"
+
+[cdp]
+host = "127.0.0.1"
+start_port = 9222
+end_port = 9229
 
 [labels]
 site = "home"
@@ -363,5 +494,53 @@ profile_path = "/profiles/empty"
 
         // Assert
         assert!(error.to_string().contains("requires account_id/platform"));
+    }
+
+    #[test]
+    fn allocates_cdp_ports_and_renders_lifecycle_templates() {
+        // Arrange
+        let raw = r#"
+machine_id = "mac-mini-1"
+
+[cdp]
+host = "127.0.0.1"
+start_port = 19322
+end_port = 19324
+
+[[profiles]]
+profile_id = "yt-main"
+account_id = "yt-main"
+platform = "youtube"
+profile_path = "/profiles/yt-main"
+
+[profiles.lifecycle]
+launch_command = ["chrome", "--remote-debugging-port={cdp_port}", "--user-data-dir={profile_path}"]
+readiness_url = "{cdp_url}"
+
+[[profiles]]
+profile_id = "x-main"
+account_id = "x-main"
+platform = "x"
+profile_path = "/profiles/x-main"
+"#;
+
+        // Act
+        let config = parse_agent_config(raw).unwrap();
+        let discovered = discover_profiles(&config).unwrap();
+
+        // Assert
+        assert_eq!(discovered[0].profile.cdp_port, 19322);
+        assert_eq!(discovered[0].profile.cdp_url, "http://127.0.0.1:19322");
+        assert_eq!(discovered[1].profile.cdp_port, 19323);
+        let lifecycle = discovered[0].lifecycle.as_ref().unwrap();
+        assert_eq!(
+            lifecycle.launch_command,
+            vec![
+                "chrome".to_string(),
+                "--remote-debugging-port=19322".to_string(),
+                "--user-data-dir=/profiles/yt-main".to_string()
+            ]
+        );
+        assert_eq!(lifecycle.readiness_url, "http://127.0.0.1:19322");
     }
 }

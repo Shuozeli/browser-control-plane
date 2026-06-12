@@ -6,8 +6,10 @@ use bcp_core::pwright::{BrowserHealth, PwrightError, PwrightGateway, SharedPwrig
 use bcp_proto::browsercontrol::v1::{
     A11yNode, BrowserProfile, ExecuteActionRequest, ExecuteActionResponse, RunScriptResponse,
 };
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::time::{Duration, Instant};
 
 use crate::config::LifecycleConfig;
 
@@ -63,7 +65,36 @@ impl LifecyclePwrightGateway {
             .spawn()
             .map_err(|error| Self::operation_failed(profile_id, error))?;
         children.insert(profile_id.to_string(), child);
+        drop(children);
+        self.wait_for_readiness(profile_id, config).await?;
         Ok(())
+    }
+
+    async fn wait_for_readiness(
+        &self,
+        profile_id: &str,
+        config: &LifecycleConfig,
+    ) -> Result<(), PwrightError> {
+        let Some((host, port)) = readiness_host_port(&config.readiness_url) else {
+            return Ok(());
+        };
+        let timeout_ms = config.readiness_timeout_ms.max(1);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let addr = format!("{host}:{port}");
+        loop {
+            match TcpStream::connect(&addr).await {
+                Ok(_) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(Self::operation_failed(
+                        profile_id,
+                        format!("CDP endpoint {addr} did not become ready: {error}"),
+                    ));
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 
     async fn stop_process(&self, profile_id: &str) -> Result<(), PwrightError> {
@@ -82,6 +113,21 @@ impl LifecyclePwrightGateway {
     fn operation_failed(profile_id: &str, error: impl std::fmt::Display) -> PwrightError {
         PwrightError::OperationFailed(profile_id.to_string(), error.to_string())
     }
+}
+
+fn readiness_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = host_port.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    let host = host.trim_matches(['[', ']']);
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
 }
 
 #[async_trait]
@@ -174,6 +220,8 @@ mod tests {
                     ],
                     working_dir: String::new(),
                     env: HashMap::new(),
+                    readiness_url: String::new(),
+                    readiness_timeout_ms: 30_000,
                 },
             )]),
         );
@@ -184,5 +232,14 @@ mod tests {
         // Assert
         assert!(health.healthy);
         assert!(gateway.stop_browser("profile-a").await.unwrap());
+    }
+
+    #[test]
+    fn parses_http_readiness_host_port() {
+        // Arrange / Act
+        let parsed = readiness_host_port("http://127.0.0.1:9222/json/version");
+
+        // Assert
+        assert_eq!(parsed, Some(("127.0.0.1".to_string(), 9222)));
     }
 }

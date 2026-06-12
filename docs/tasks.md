@@ -14,9 +14,9 @@
 - [x] Add local SQLite state.
 - [x] Add profile config file format.
 - [x] Implement config-driven local profile discovery.
-- [ ] Implement CDP port allocation.
+- [x] Implement CDP port allocation.
 - [x] Implement config-driven browser process launch and stop.
-- [x] Implement browser health check.
+- [x] Implement browser health check and CDP readiness probe.
 - [ ] Add lease cache and local fencing validation.
 
 ## Phase 2: Global Controller

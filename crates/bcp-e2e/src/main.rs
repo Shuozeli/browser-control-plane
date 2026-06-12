@@ -212,11 +212,11 @@ account_id = "yt-sqlite"
 platform = "youtube"
 profile_path = "/profiles/youtube-sqlite"
 display_name = "YouTube SQLite"
-cdp_url = "recording://pwright-gateway"
 capabilities = ["snapshot", "click"]
 
 [profiles.lifecycle]
-launch_command = ["sh", "-c", "sleep 30"]
+launch_command = ["sh", "-c", "sleep 30 # allocated {cdp_port} for {profile_id}"]
+readiness_url = "recording://skip"
 "#,
     )?;
 

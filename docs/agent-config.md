@@ -16,6 +16,11 @@ Example:
 machine_id = "mac-mini-1"
 gateway = "recording" # recording or real-pwright
 
+[cdp]
+host = "127.0.0.1"
+start_port = 9222
+end_port = 9322
+
 [labels]
 site = "home"
 owner = "media-team"
@@ -36,10 +41,11 @@ tier = "prod"
 [profiles.lifecycle]
 launch_command = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  "--remote-debugging-port=9222",
-  "--user-data-dir=/Users/me/ChromeProfiles/yt-main"
+  "--remote-debugging-port={cdp_port}",
+  "--user-data-dir={profile_path}"
 ]
 working_dir = "/Users/me"
+readiness_timeout_ms = 30000
 
 [profiles.lifecycle.env]
 CHROME_LOG_FILE = "/tmp/yt-main-chrome.log"
@@ -50,13 +56,22 @@ Notes:
 - `machine_id` is the machine identity reported to the global controller.
 - `gateway = "recording"` is for fake/local tests.
 - `gateway = "real-pwright"` requires `bcp-agent --features real-pwright`.
+- `[cdp]` controls automatic CDP port allocation. If a profile omits
+  `cdp_url` and `cdp_port`, the agent picks the first currently free port in
+  `start_port..=end_port` and sets `cdp_url = "http://host:port"`.
 - `profile_path` is durable local identity for the Chrome profile.
-- `cdp_url` is the local CDP endpoint that the pwright layer uses.
+- `cdp_url` is the local CDP endpoint that the pwright layer uses. It can be
+  omitted when `[cdp]` allocation should choose the port.
 - `initial_url` is used by real pwright when it opens a tab.
 - `lifecycle` is the local browser process declaration. When present, the
   agent starts `launch_command` before `check_browser` or `ensure_browser`,
   restarts it if the child exits, and kills it during `stop_browser`. The
   profile is also marked with `bcp.lifecycle = managed`.
+- `launch_command`, `working_dir`, `env`, and `readiness_url` support
+  `{profile_id}`, `{profile_path}`, `{cdp_url}`, and `{cdp_port}` templates.
+- `readiness_url` defaults to the profile's `cdp_url`. For HTTP/HTTPS URLs the
+  agent waits for the host/port to accept TCP connections after launch. Non-HTTP
+  URLs are treated as no-op readiness probes for fake gateways.
 
 Multiple accounts can be attached to one profile:
 
