@@ -192,15 +192,44 @@ async fn sqlite_persistence_main() -> anyhow::Result<()> {
 
     let controller_db = root.join("controller.sqlite");
     let agent_db = root.join("agent.sqlite");
+    let agent_config = root.join("agent.toml");
     let controller_addr = "127.0.0.1:7010";
     let agent_addr = "127.0.0.1:7110";
     let controller_endpoint = format!("http://{controller_addr}");
     let agent_endpoint = format!("http://{agent_addr}");
+    std::fs::write(
+        &agent_config,
+        r#"
+machine_id = "machine-sqlite"
+gateway = "recording"
+
+[labels]
+cluster = "sqlite-e2e"
+
+[[profiles]]
+profile_id = "youtube-sqlite"
+account_id = "yt-sqlite"
+platform = "youtube"
+profile_path = "/profiles/youtube-sqlite"
+display_name = "YouTube SQLite"
+cdp_url = "recording://pwright-gateway"
+capabilities = ["snapshot", "click"]
+
+[profiles.lifecycle]
+launch_command = ["sh", "-c", "sleep 30"]
+"#,
+    )?;
 
     let mut controller =
         spawn_controller(controller_addr, &controller_db).context("spawn first controller")?;
-    let mut agent = spawn_agent(agent_addr, &agent_db, &controller_endpoint, &agent_endpoint)
-        .context("spawn agent")?;
+    let mut agent = spawn_agent(
+        agent_addr,
+        &agent_db,
+        &agent_config,
+        &controller_endpoint,
+        &agent_endpoint,
+    )
+    .context("spawn agent")?;
 
     let mut global = connect_global(&controller_endpoint).await?;
     wait_for_auto_registered_profile(&mut global, "machine-sqlite", "yt-sqlite").await?;
@@ -512,6 +541,7 @@ fn spawn_controller(addr: &str, db_path: &Path) -> anyhow::Result<Child> {
 fn spawn_agent(
     addr: &str,
     db_path: &Path,
+    config_path: &Path,
     controller_endpoint: &str,
     agent_endpoint: &str,
 ) -> anyhow::Result<Child> {
@@ -522,13 +552,11 @@ fn spawn_agent(
         .arg(addr)
         .arg("--db-path")
         .arg(db_path)
+        .arg("--config-path")
+        .arg(config_path)
         .env("BCP_CONTROLLER", controller_endpoint)
         .env("BCP_CONTROLLER_REGISTER_SECONDS", "1")
         .env("BCP_AGENT_PUBLIC_ADDR", agent_endpoint)
-        .env("BCP_MACHINE_ID", "machine-sqlite")
-        .env("BCP_E2E_PROFILE_ID", "youtube-sqlite")
-        .env("BCP_E2E_ACCOUNT_ID", "yt-sqlite")
-        .env("BCP_E2E_PLATFORM", "youtube")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;

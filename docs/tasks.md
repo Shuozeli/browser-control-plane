@@ -12,11 +12,11 @@
 ## Phase 1: Local Machine Controller
 
 - [x] Add local SQLite state.
-- [ ] Add profile config file format.
-- [ ] Implement local profile discovery.
+- [x] Add profile config file format.
+- [x] Implement config-driven local profile discovery.
 - [ ] Implement CDP port allocation.
-- [ ] Implement Chrome process launch and stop.
-- [ ] Implement browser health check.
+- [x] Implement config-driven browser process launch and stop.
+- [x] Implement browser health check.
 - [ ] Add lease cache and local fencing validation.
 
 ## Phase 2: Global Controller

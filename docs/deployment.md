@@ -119,6 +119,17 @@ profile_id|account_id|platform|cdp_url|initial_url;profile_id2|account_id2|platf
 Supported platform names: `youtube`, `x`, `douyin`, `tiktok`, `reddit`,
 `zhihu`, `weibo`.
 
+For persistent deployments, prefer a TOML config file over env profile strings:
+
+```bash
+mkdir -p .bcp
+$EDITOR .bcp/agent.toml
+cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100 --config-path .bcp/agent.toml
+```
+
+See [Agent Profile Config](agent-config.md) for the schema and lifecycle
+fields.
+
 Optional durable path override:
 
 ```bash
@@ -228,6 +239,59 @@ cargo run --release -p bcp-agent -- --addr $TAILSCALE_IP:7100
 The agent registers itself with `agent_grpc_addr =
 http://<machine-magicdns-name>:7100`.
 
+## PM2 Guide
+
+This project does not prescribe a production service manager. For lightweight
+single-user deployments, PM2 is the recommended guide path because it works
+across Linux, macOS, and Windows.
+
+Build release binaries once:
+
+```bash
+cargo build --release
+```
+
+Example `ecosystem.config.cjs`:
+
+```javascript
+const ip = process.env.TAILSCALE_IP || "0.0.0.0";
+const host = process.env.TAILSCALE_HOST || "127.0.0.1";
+
+module.exports = {
+  apps: [
+    {
+      name: "bcp-controller",
+      script: "./target/release/bcp-controller",
+      args: `--addr ${ip}:7000 --db-path .bcp/controller.sqlite`,
+      env: {
+        RUST_LOG: "info"
+      }
+    },
+    {
+      name: "bcp-agent",
+      script: "./target/release/bcp-agent",
+      args: `--addr ${ip}:7100 --db-path .bcp/agent.sqlite --config-path .bcp/agent.toml`,
+      env: {
+        BCP_CONTROLLER: `http://${host}:7000`,
+        BCP_AGENT_PUBLIC_ADDR: `http://${host}:7100`,
+        RUST_LOG: "info"
+      }
+    }
+  ]
+};
+```
+
+Start and inspect:
+
+```bash
+pm2 start ecosystem.config.cjs
+pm2 status
+pm2 logs bcp-agent
+```
+
+Use full Tailscale MagicDNS hostnames in `BCP_CONTROLLER` and
+`BCP_AGENT_PUBLIC_ADDR` when the processes are accessed from another machine.
+
 ### 4. Verify Fleet Routing
 
 From a client machine:
@@ -284,6 +348,7 @@ fetches `pwright-bridge` from the `Shuozeli/pwright` git dependency.
 | `BCP_CONTROLLER_DB` | controller | SQLite path for global fleet state |
 | `BCP_AGENT_ADDR` | agent | Explicit machine controller bind address |
 | `BCP_AGENT_DB` | agent | SQLite path for local profile state |
+| `BCP_AGENT_CONFIG` | agent | TOML profile discovery config path |
 | `BCP_AGENT_PUBLIC_ADDR` | agent | Public machine-controller URL reported to the global controller |
 | `BCP_AGENT_GRPC_ADDR` | agent | Fallback public machine-controller URL |
 | `BCP_CONTROLLER` | client, E2E | Global controller endpoint |

@@ -3,6 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bcp_agent::AgentService;
+use bcp_agent::config::{
+    AgentConfig, DiscoveredProfile, GatewayKind, discover_config_path, discover_profiles,
+    load_agent_config,
+};
+use bcp_agent::lifecycle::LifecyclePwrightGateway;
 #[cfg(feature = "real-pwright")]
 use bcp_core::pwright::{RealPwrightGateway, RealPwrightProfile};
 use bcp_core::pwright::{RecordingProfileState, RecordingPwrightGateway};
@@ -26,6 +31,15 @@ struct Args {
     /// SQLite database path for local agent profile state.
     #[arg(long, env = "BCP_AGENT_DB")]
     db_path: Option<PathBuf>,
+
+    /// TOML profile discovery config. Defaults to BCP_AGENT_CONFIG, then .bcp/agent.toml.
+    #[arg(long, env = "BCP_AGENT_CONFIG")]
+    config_path: Option<PathBuf>,
+}
+
+struct RuntimeConfig {
+    service: AgentService,
+    machine_labels: std::collections::HashMap<String, String>,
 }
 
 #[tokio::main]
@@ -41,14 +55,15 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     tracing::info!(%addr, db_path = %db_path.display(), "starting machine controller");
-    let service = build_service_from_env();
+    let runtime = build_runtime(args.config_path)?;
+    let service = runtime.service;
     if service.list_profiles().is_empty() {
         hydrate_profiles_from_sqlite(&service, &db_path)?;
     }
     persist_profiles_to_sqlite(&service, &db_path)?;
     spawn_fleet_heartbeat(service.clone());
     spawn_artifact_cleanup(service.clone());
-    spawn_controller_registration(service.clone(), addr);
+    spawn_controller_registration(service.clone(), addr, runtime.machine_labels);
 
     tonic::transport::Server::builder()
         .add_service(MachineControllerServer::new(service))
@@ -67,6 +82,114 @@ fn default_addr() -> SocketAddr {
 
 fn default_db_path() -> PathBuf {
     PathBuf::from(".bcp").join("agent.sqlite")
+}
+
+fn build_runtime(config_path: Option<PathBuf>) -> anyhow::Result<RuntimeConfig> {
+    if let Some(path) = discover_config_path(config_path) {
+        let config = load_agent_config(&path)?;
+        tracing::info!(config_path = %path.display(), "loaded agent profile config");
+        return build_runtime_from_config(config);
+    }
+    Ok(RuntimeConfig {
+        service: build_service_from_env(),
+        machine_labels: parse_labels_env("BCP_MACHINE_LABELS"),
+    })
+}
+
+fn build_runtime_from_config(config: AgentConfig) -> anyhow::Result<RuntimeConfig> {
+    let discovered = discover_profiles(&config)?;
+    let service = match config.gateway {
+        GatewayKind::Recording => {
+            build_recording_service_from_discovered(&config.machine_id, discovered)
+        }
+        GatewayKind::RealPwright => {
+            build_real_service_from_discovered(&config.machine_id, discovered)?
+        }
+    };
+    Ok(RuntimeConfig {
+        service,
+        machine_labels: config.labels,
+    })
+}
+
+fn build_recording_service_from_discovered(
+    machine_id: &str,
+    discovered: Vec<DiscoveredProfile>,
+) -> AgentService {
+    let lifecycles = lifecycle_map(&discovered);
+    let states: Vec<RecordingProfileState> = discovered
+        .into_iter()
+        .map(|entry| RecordingProfileState {
+            profile: entry.profile,
+            healthy: true,
+            health_message: "recording pwright gateway ok".to_string(),
+            snapshot: vec![A11yNode {
+                r#ref: "e1".to_string(),
+                role: "button".to_string(),
+                name: "Publish".to_string(),
+                depth: 1,
+                value: String::new(),
+            }],
+            eval_json: r#"{"source":"recording_gateway"}"#.to_string(),
+        })
+        .collect();
+    let gateway = LifecyclePwrightGateway::maybe_wrap(
+        Arc::new(RecordingPwrightGateway::new(states.clone())),
+        lifecycles,
+    );
+    let service = AgentService::new_for_machine(machine_id, gateway);
+    for state in states {
+        service.upsert_desired_profile(state.profile);
+    }
+    service
+}
+
+#[cfg(feature = "real-pwright")]
+fn build_real_service_from_discovered(
+    machine_id: &str,
+    discovered: Vec<DiscoveredProfile>,
+) -> anyhow::Result<AgentService> {
+    let lifecycles = lifecycle_map(&discovered);
+    let profiles: Vec<RealPwrightProfile> = discovered
+        .into_iter()
+        .map(|entry| RealPwrightProfile {
+            profile: entry.profile,
+            initial_url: entry.initial_url,
+        })
+        .collect();
+    let gateway = LifecyclePwrightGateway::maybe_wrap(
+        Arc::new(RealPwrightGateway::new(profiles.clone())),
+        lifecycles,
+    );
+    let service = AgentService::new_for_machine(machine_id, gateway);
+    for profile in profiles {
+        service.upsert_desired_profile(profile.profile);
+    }
+    Ok(service)
+}
+
+fn lifecycle_map(
+    discovered: &[DiscoveredProfile],
+) -> std::collections::HashMap<String, bcp_agent::config::LifecycleConfig> {
+    discovered
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .lifecycle
+                .clone()
+                .map(|lifecycle| (entry.profile.profile_id.clone(), lifecycle))
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "real-pwright"))]
+fn build_real_service_from_discovered(
+    _machine_id: &str,
+    _discovered: Vec<DiscoveredProfile>,
+) -> anyhow::Result<AgentService> {
+    anyhow::bail!(
+        "gateway = 'real-pwright' requires building bcp-agent with --features real-pwright"
+    )
 }
 
 fn build_service_from_env() -> AgentService {
@@ -289,7 +412,11 @@ fn spawn_artifact_cleanup(service: AgentService) {
     });
 }
 
-fn spawn_controller_registration(service: AgentService, bind_addr: SocketAddr) {
+fn spawn_controller_registration(
+    service: AgentService,
+    bind_addr: SocketAddr,
+    machine_labels: std::collections::HashMap<String, String>,
+) {
     let Ok(controller) = std::env::var("BCP_CONTROLLER") else {
         return;
     };
@@ -304,7 +431,8 @@ fn spawn_controller_registration(service: AgentService, bind_addr: SocketAddr) {
         loop {
             interval.tick().await;
             if let Err(error) =
-                register_with_controller(&controller, &agent_grpc_addr, &service).await
+                register_with_controller(&controller, &agent_grpc_addr, &service, &machine_labels)
+                    .await
             {
                 tracing::warn!(%error, controller, "controller registration failed");
             }
@@ -316,6 +444,7 @@ async fn register_with_controller(
     controller: &str,
     agent_grpc_addr: &str,
     service: &AgentService,
+    machine_labels: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let machine_id = service.machine_id();
     let mut client = GlobalControllerClient::connect(controller.to_string()).await?;
@@ -327,7 +456,7 @@ async fn register_with_controller(
                 tailscale_host: std::env::var("TAILSCALE_HOST").unwrap_or_default(),
                 agent_grpc_addr: agent_grpc_addr.to_string(),
                 status: MachineStatus::Online as i32,
-                labels: parse_labels_env("BCP_MACHINE_LABELS"),
+                labels: machine_labels.clone(),
                 last_heartbeat_unix_ms: 0,
             }),
             profiles: service.list_profiles(),

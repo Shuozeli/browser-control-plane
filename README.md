@@ -81,6 +81,7 @@ only needs the controller and agent processes.
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/deployment.md)
 - [Agent Runbook](docs/agent-runbook.md)
+- [Agent Profile Config](docs/agent-config.md)
 - [Design](docs/design.md)
 - [HTML Serve Design](docs/html-serve-design.md)
 - [Observability Design](docs/observability-design.md)

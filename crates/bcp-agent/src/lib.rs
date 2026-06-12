@@ -14,6 +14,9 @@ use bcp_proto::browsercontrol::v1::upload_artifact_request::Part;
 use bcp_proto::browsercontrol::v1::*;
 use tonic::{Request, Response, Status};
 
+pub mod config;
+pub mod lifecycle;
+
 #[derive(Clone)]
 pub struct AgentService {
     leases: Arc<RwLock<HashMap<String, LocalLease>>>,

@@ -29,6 +29,13 @@ export BCP_CONTROLLER=http://${TAILSCALE_HOST:-127.0.0.1}:7000
 cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100
 ```
 
+For config-driven discovery, replace the env profile variables with
+`.bcp/agent.toml` and start:
+
+```bash
+cargo run --release -p bcp-agent -- --addr ${TAILSCALE_IP:-0.0.0.0}:7100 --config-path .bcp/agent.toml
+```
+
 ### Verify auto-registration
 
 `bcp-agent` registers its profiles with the global controller when
