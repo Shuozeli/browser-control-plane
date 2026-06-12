@@ -99,7 +99,30 @@ Expected terminal line:
 docker sqlite e2e passed: auto-registration and sqlite restore work
 ```
 
-## Codelab 4: Real-Browser Docker E2E
+## Codelab 4: Fake Failure Docker E2E
+
+This deterministic failure test starts real controller and agent processes but
+uses the recording pwright gateway. It verifies:
+
+- `stop_browser` makes the fake browser unhealthy and it can be brought back
+- a restarted machine controller rejects leases installed before restart
+- a restarted empty global controller learns machine/profile/account state from
+  the still-running agent registration loop
+
+Run:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.failures.yml up --build --abort-on-container-exit --exit-code-from fake-failures-e2e
+docker compose -f tests/e2e/docker-compose.failures.yml down
+```
+
+Expected terminal line:
+
+```text
+docker fake-failures e2e passed: browser recovery, agent restart, and controller re-register work
+```
+
+## Codelab 5: Real-Browser Docker E2E
 
 This test runs:
 
@@ -125,7 +148,7 @@ docker real-browser e2e passed: controller routed to real CDP browsers
 If this fails before building, check whether Cargo can fetch the `Shuozeli/pwright`
 git dependency used by the `bcp-agent/real-pwright` feature.
 
-## Codelab 5: WSJ Real-Web Docker E2E
+## Codelab 6: WSJ Real-Web Docker E2E
 
 This manual smoke test runs a larger topology against the live internet:
 
@@ -153,7 +176,7 @@ This test is intentionally not part of default CI. WSJ can change markup, block
 automation, require regional consent flows, or be unavailable from the runner's
 network.
 
-## Codelab 6: Lookup Versus Acquire
+## Codelab 7: Lookup Versus Acquire
 
 Lookup answers where an account lives and whether it is available. It does not
 grant permission to operate the browser.
@@ -173,7 +196,7 @@ Important security invariant:
 - Lookup must not show `fencing_token`.
 - Browser work must go through the machine controller, not directly to CDP.
 
-## Codelab 7: Bug Report Drill
+## Codelab 8: Bug Report Drill
 
 When a codelab fails, create a bug report using the template in
 [Agent Runbook](agent-runbook.md#bug-report-format).

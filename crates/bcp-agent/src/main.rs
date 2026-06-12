@@ -214,6 +214,17 @@ fn build_service_from_env() -> AgentService {
         .ok()
         .and_then(|value| parse_platform(&value))
         .unwrap_or(AccountPlatform::Youtube);
+    let healthy = std::env::var("BCP_E2E_HEALTHY")
+        .ok()
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true);
+    let health_message = std::env::var("BCP_E2E_HEALTH_MESSAGE").unwrap_or_else(|_| {
+        if healthy {
+            "recording pwright gateway ok".to_string()
+        } else {
+            "recording pwright gateway crashed".to_string()
+        }
+    });
 
     let profile = BrowserProfile {
         profile_id: profile_id.clone(),
@@ -235,8 +246,8 @@ fn build_service_from_env() -> AgentService {
     };
     let gateway = RecordingPwrightGateway::new([RecordingProfileState {
         profile: profile.clone(),
-        healthy: true,
-        health_message: "recording pwright gateway ok".to_string(),
+        healthy,
+        health_message,
         snapshot: vec![A11yNode {
             r#ref: "e1".to_string(),
             role: "button".to_string(),
@@ -371,6 +382,14 @@ fn parse_platform(value: &str) -> Option<AccountPlatform> {
         "zhihu" => Some(AccountPlatform::Zhihu),
         "weibo" => Some(AccountPlatform::Weibo),
         "wsj" => Some(AccountPlatform::Wsj),
+        _ => None,
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" => Some(true),
+        "0" | "false" | "no" | "n" => Some(false),
         _ => None,
     }
 }

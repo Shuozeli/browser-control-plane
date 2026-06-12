@@ -47,6 +47,16 @@ SQLite persistence topology:
 - Verify the restored controller can return the active lease route and lookup
   state.
 
+Fake failure topology:
+
+- Start real controller and agent processes inside the Docker e2e runner.
+- Use the recording pwright gateway as the browser component.
+- Stop the fake browser and verify the control path can bring it back.
+- Restart the machine controller and verify the old locally installed lease is
+  rejected after restart.
+- Restart the global controller with empty state and verify the still-running
+  agent re-registers its machine/profile/account mapping.
+
 WSJ real-web topology:
 
 - Start one global controller.
@@ -65,5 +75,6 @@ WSJ real-web topology:
 ```bash
 docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit
 docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
+docker compose -f tests/e2e/docker-compose.failures.yml up --build --abort-on-container-exit --exit-code-from fake-failures-e2e
 docker compose -f tests/e2e/docker-compose.wsj.yml up --build --abort-on-container-exit --exit-code-from e2e-client
 ```

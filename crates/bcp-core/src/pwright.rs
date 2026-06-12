@@ -92,27 +92,29 @@ impl RecordingPwrightGateway {
 #[async_trait]
 impl PwrightGateway for RecordingPwrightGateway {
     async fn ensure_browser(&self, profile_id: &str) -> Result<BrowserProfile, PwrightError> {
-        let state = self
+        let mut profiles = self
             .profiles
-            .read()
-            .expect("recording pwright gateway profile lock poisoned")
-            .get(profile_id)
-            .cloned()
+            .write()
+            .expect("recording pwright gateway profile lock poisoned");
+        let state = profiles
+            .get_mut(profile_id)
             .ok_or_else(|| PwrightError::ProfileNotFound(profile_id.to_string()))?;
-        Ok(state.profile)
+        state.healthy = true;
+        state.health_message = "recording pwright gateway ok".to_string();
+        Ok(state.profile.clone())
     }
 
     async fn stop_browser(&self, profile_id: &str) -> Result<bool, PwrightError> {
-        if self
+        let mut profiles = self
             .profiles
-            .read()
-            .expect("recording pwright gateway profile lock poisoned")
-            .contains_key(profile_id)
-        {
-            Ok(true)
-        } else {
-            Err(PwrightError::ProfileNotFound(profile_id.to_string()))
-        }
+            .write()
+            .expect("recording pwright gateway profile lock poisoned");
+        let state = profiles
+            .get_mut(profile_id)
+            .ok_or_else(|| PwrightError::ProfileNotFound(profile_id.to_string()))?;
+        state.healthy = false;
+        state.health_message = "recording pwright gateway stopped".to_string();
+        Ok(true)
     }
 
     async fn check_browser(&self, profile_id: &str) -> Result<BrowserHealth, PwrightError> {
@@ -550,5 +552,29 @@ mod tests {
         assert!(!health.healthy);
         assert_eq!(health.message, "crashed");
         assert_eq!(ensured.profile_id, "youtube-main");
+    }
+
+    #[tokio::test]
+    async fn recording_gateway_ensure_recovers_health_after_stop() {
+        // Arrange
+        let gateway = RecordingPwrightGateway::new([RecordingProfileState {
+            profile: profile("youtube-main"),
+            healthy: true,
+            health_message: "ok".to_string(),
+            snapshot: vec![],
+            eval_json: "{}".to_string(),
+        }]);
+
+        // Act
+        gateway.stop_browser("youtube-main").await.unwrap();
+        let stopped_health = gateway.check_browser("youtube-main").await.unwrap();
+        gateway.ensure_browser("youtube-main").await.unwrap();
+        let recovered_health = gateway.check_browser("youtube-main").await.unwrap();
+
+        // Assert
+        assert!(!stopped_health.healthy);
+        assert_eq!(stopped_health.message, "recording pwright gateway stopped");
+        assert!(recovered_health.healthy);
+        assert_eq!(recovered_health.message, "recording pwright gateway ok");
     }
 }

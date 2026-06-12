@@ -328,6 +328,14 @@ COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.sqlite.yml up 
 docker compose -f tests/e2e/docker-compose.sqlite.yml down
 ```
 
+Fake failure topology for browser recovery, agent restart, and controller
+re-registration:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.failures.yml up --build --abort-on-container-exit --exit-code-from fake-failures-e2e
+docker compose -f tests/e2e/docker-compose.failures.yml down
+```
+
 Real browser topology with two isolated machine networks and three Chrome
 instances per machine:
 
@@ -366,6 +374,8 @@ This is an external-network smoke test, not a deterministic CI test.
 | `BCP_E2E_PROFILE_ID` | agent | Fake profile id for recording gateway |
 | `BCP_E2E_ACCOUNT_ID` | agent | Fake account id for recording gateway |
 | `BCP_E2E_PLATFORM` | agent | Fake account platform |
+| `BCP_E2E_HEALTHY` | agent | Initial fake browser health for recording gateway |
+| `BCP_E2E_HEALTH_MESSAGE` | agent | Initial fake browser health message |
 | `BCP_REAL_PROFILES` | agent | Real CDP profile mapping |
 | `BCP_BROWSER_HEARTBEAT_SECONDS` | agent | Local fleet reconcile interval |
 | `BCP_CONTROLLER_REGISTER_SECONDS` | agent | Agent auto-registration interval |

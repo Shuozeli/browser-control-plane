@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
     match std::env::var("BCP_E2E_MODE").as_deref() {
         Ok("real-browser") => real_browser_main().await,
         Ok("real-web-wsj") => real_web_wsj_main().await,
+        Ok("fake-failures") => fake_failures_main().await,
         Ok("sqlite-persistence") => sqlite_persistence_main().await,
         _ => recording_main().await,
     }
@@ -324,6 +325,172 @@ readiness_url = "recording://skip"
     stop_child(&mut agent, "agent").await?;
 
     println!("docker sqlite e2e passed: auto-registration and sqlite restore work");
+    Ok(())
+}
+
+async fn fake_failures_main() -> anyhow::Result<()> {
+    let root = Path::new("/tmp/bcp-fake-failures-e2e");
+    if root.exists() {
+        std::fs::remove_dir_all(root)?;
+    }
+    std::fs::create_dir_all(root)?;
+
+    let controller_addr = "127.0.0.1:7020";
+    let agent_addr = "127.0.0.1:7120";
+    let controller_endpoint = format!("http://{controller_addr}");
+    let agent_endpoint = format!("http://{agent_addr}");
+    let first_controller_db = root.join("controller-first.sqlite");
+    let restored_controller_db = root.join("controller-restored.sqlite");
+    let agent_db = root.join("agent.sqlite");
+    let agent_spec = RecordingAgentSpec {
+        machine_id: "machine-failure",
+        profile_id: "youtube-failure",
+        account_id: "yt-failure",
+        agent_endpoint: &agent_endpoint,
+    };
+
+    let mut controller =
+        spawn_controller(controller_addr, &first_controller_db).context("spawn controller")?;
+    let mut agent = spawn_recording_agent(
+        agent_addr,
+        &agent_db,
+        &controller_endpoint,
+        &agent_spec,
+        true,
+    )
+    .context("spawn recording agent")?;
+
+    let mut global = connect_global(&controller_endpoint).await?;
+    wait_for_auto_registered_profile(&mut global, "machine-failure", "yt-failure").await?;
+
+    let (route, lease) = acquire_youtube(&mut global, "fake-failures", "yt-failure").await?;
+    if route.agent_grpc_addr != agent_endpoint {
+        bail!(
+            "expected route to restarted-test agent {agent_endpoint}, got {}",
+            route.agent_grpc_addr
+        );
+    }
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    let mut routed_agent = connect_agent(&route.agent_grpc_addr).await?;
+    routed_agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+
+    routed_agent
+        .stop_browser(StopBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    let stopped = routed_agent
+        .check_browser(CheckBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?
+        .into_inner();
+    if stopped.healthy {
+        bail!("expected fake browser to be unhealthy after stop_browser");
+    }
+    routed_agent
+        .ensure_browser(EnsureBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    let recovered = routed_agent
+        .check_browser(CheckBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?
+        .into_inner();
+    if !recovered.healthy {
+        bail!(
+            "expected fake browser to recover after ensure_browser, got {}",
+            recovered.message
+        );
+    }
+
+    stop_child(&mut agent, "first agent").await?;
+    let mut restarted_agent = spawn_recording_agent(
+        agent_addr,
+        &agent_db,
+        &controller_endpoint,
+        &agent_spec,
+        true,
+    )
+    .context("spawn restarted recording agent")?;
+    wait_for_auto_registered_profile(&mut global, "machine-failure", "yt-failure").await?;
+    let mut restarted_agent_client = connect_agent(&agent_endpoint).await?;
+    let old_lease_result = restarted_agent_client
+        .execute_action(ExecuteActionRequest {
+            lease: Some(lease_context.clone()),
+            action: "click".to_string(),
+            r#ref: "e1".to_string(),
+            text: String::new(),
+            key: String::new(),
+            options: HashMap::new(),
+        })
+        .await;
+    match old_lease_result {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {}
+        Err(status) => bail!("restarted agent returned unexpected status for old lease: {status}"),
+        Ok(_) => bail!("restarted agent accepted a lease that was installed before restart"),
+    }
+
+    global
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: lease.lease_id.clone(),
+            fencing_token: lease.fencing_token.clone(),
+        })
+        .await?;
+    let (_route, new_lease) = acquire_youtube(&mut global, "fake-failures", "yt-failure").await?;
+    let new_lease_context = LeaseContext {
+        lease_id: new_lease.lease_id.clone(),
+        profile_id: new_lease.profile_id.clone(),
+        fencing_token: new_lease.fencing_token.clone(),
+    };
+    restarted_agent_client
+        .install_lease(InstallLeaseRequest {
+            lease: Some(new_lease_context.clone()),
+        })
+        .await?;
+    assert_action_succeeds(&mut restarted_agent_client, new_lease_context).await?;
+
+    stop_child(&mut controller, "first controller").await?;
+    let mut restored_controller = spawn_controller(controller_addr, &restored_controller_db)
+        .context("spawn restored empty controller")?;
+    let mut restored_global = connect_global(&controller_endpoint).await?;
+    wait_for_auto_registered_profile(&mut restored_global, "machine-failure", "yt-failure").await?;
+    let (restored_route, restored_lease) =
+        acquire_youtube(&mut restored_global, "fake-failures", "yt-failure").await?;
+    if restored_route.agent_grpc_addr != agent_endpoint {
+        bail!(
+            "expected route after controller restart to {agent_endpoint}, got {}",
+            restored_route.agent_grpc_addr
+        );
+    }
+    let restored_lease_context = LeaseContext {
+        lease_id: restored_lease.lease_id,
+        profile_id: restored_lease.profile_id,
+        fencing_token: restored_lease.fencing_token,
+    };
+    restarted_agent_client
+        .install_lease(InstallLeaseRequest {
+            lease: Some(restored_lease_context.clone()),
+        })
+        .await?;
+    assert_action_succeeds(&mut restarted_agent_client, restored_lease_context).await?;
+
+    stop_child(&mut restored_controller, "restored controller").await?;
+    stop_child(&mut restarted_agent, "restarted agent").await?;
+
+    println!(
+        "docker fake-failures e2e passed: browser recovery, agent restart, and controller re-register work"
+    );
     Ok(())
 }
 
@@ -753,6 +920,87 @@ fn spawn_agent(
         .stderr(Stdio::inherit())
         .spawn()?;
     Ok(child)
+}
+
+struct RecordingAgentSpec<'a> {
+    machine_id: &'a str,
+    profile_id: &'a str,
+    account_id: &'a str,
+    agent_endpoint: &'a str,
+}
+
+fn spawn_recording_agent(
+    addr: &str,
+    db_path: &Path,
+    controller_endpoint: &str,
+    spec: &RecordingAgentSpec<'_>,
+    healthy: bool,
+) -> anyhow::Result<Child> {
+    let binary =
+        std::env::var("BCP_AGENT_BIN").unwrap_or_else(|_| "/usr/local/bin/bcp-agent".to_string());
+    let child = Command::new(binary)
+        .arg("--addr")
+        .arg(addr)
+        .arg("--db-path")
+        .arg(db_path)
+        .env("BCP_CONTROLLER", controller_endpoint)
+        .env("BCP_CONTROLLER_REGISTER_SECONDS", "1")
+        .env("BCP_BROWSER_HEARTBEAT_SECONDS", "60")
+        .env("BCP_AGENT_PUBLIC_ADDR", spec.agent_endpoint)
+        .env("BCP_MACHINE_ID", spec.machine_id)
+        .env("BCP_E2E_PROFILE_ID", spec.profile_id)
+        .env("BCP_E2E_ACCOUNT_ID", spec.account_id)
+        .env("BCP_E2E_PLATFORM", "youtube")
+        .env("BCP_E2E_HEALTHY", if healthy { "true" } else { "false" })
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(child)
+}
+
+async fn acquire_youtube(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    client_id: &str,
+    account_id: &str,
+) -> anyhow::Result<(BrowserRoute, BrowserLease)> {
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: client_id.to_string(),
+            purpose: "fake-failure-recovery".to_string(),
+            platform: AccountPlatform::Youtube as i32,
+            account_id: account_id.to_string(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 300,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("controller did not return route")?;
+    let lease = acquired.lease.context("controller did not return lease")?;
+    Ok((route, lease))
+}
+
+async fn assert_action_succeeds(
+    agent: &mut MachineControllerClient<tonic::transport::Channel>,
+    lease: LeaseContext,
+) -> anyhow::Result<()> {
+    let action = agent
+        .execute_action(ExecuteActionRequest {
+            lease: Some(lease),
+            action: "click".to_string(),
+            r#ref: "e1".to_string(),
+            text: String::new(),
+            key: String::new(),
+            options: HashMap::new(),
+        })
+        .await?
+        .into_inner();
+    if !action.success {
+        bail!(
+            "expected fake browser action to succeed: {}",
+            action.message
+        );
+    }
+    Ok(())
 }
 
 async fn stop_child(child: &mut Child, name: &str) -> anyhow::Result<()> {

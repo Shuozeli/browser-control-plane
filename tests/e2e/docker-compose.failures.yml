@@ -1,0 +1,15 @@
+services:
+  fake-failures-e2e:
+    build:
+      context: ../..
+    image: browser-control-plane:local
+    entrypoint:
+      - /usr/local/bin/bcp-e2e
+    environment:
+      BCP_E2E_MODE: fake-failures
+    networks:
+      k3s-pod-net:
+
+networks:
+  k3s-pod-net:
+    name: browser-control-plane-failures-k3s
