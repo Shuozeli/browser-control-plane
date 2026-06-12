@@ -257,6 +257,13 @@ COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.yml up --build
 docker compose -f tests/e2e/docker-compose.yml down
 ```
 
+SQLite persistence and auto-registration topology:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
+docker compose -f tests/e2e/docker-compose.sqlite.yml down
+```
+
 Real browser topology with two isolated machine networks and three Chrome
 instances per machine:
 

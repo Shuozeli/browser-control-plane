@@ -72,7 +72,27 @@ Expected terminal line:
 docker e2e passed: controller routed to recording pwright gateway
 ```
 
-## Codelab 3: Real-Browser Docker E2E
+## Codelab 3: SQLite Persistence Docker E2E
+
+This test starts real controller and agent processes inside Docker, uses
+SQLite-backed controller and agent state, waits for agent auto-registration,
+acquires a lease, restarts the controller process, and verifies the route and
+active lease are restored.
+
+Run:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
+docker compose -f tests/e2e/docker-compose.sqlite.yml down
+```
+
+Expected terminal line:
+
+```text
+docker sqlite e2e passed: auto-registration and sqlite restore work
+```
+
+## Codelab 4: Real-Browser Docker E2E
 
 This test runs:
 
@@ -98,7 +118,7 @@ docker real-browser e2e passed: controller routed to real CDP browsers
 If this fails before building, check whether Cargo can fetch the `Shuozeli/pwright`
 git dependency used by the `bcp-agent/real-pwright` feature.
 
-## Codelab 4: Lookup Versus Acquire
+## Codelab 5: Lookup Versus Acquire
 
 Lookup answers where an account lives and whether it is available. It does not
 grant permission to operate the browser.

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -6,13 +8,15 @@ use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerCli
 use bcp_proto::browsercontrol::v1::machine_controller_client::MachineControllerClient;
 use bcp_proto::browsercontrol::v1::upload_artifact_request::Part;
 use bcp_proto::browsercontrol::v1::*;
+use tokio::process::{Child, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::var("BCP_E2E_MODE").as_deref() == Ok("real-browser") {
-        return real_browser_main().await;
+    match std::env::var("BCP_E2E_MODE").as_deref() {
+        Ok("real-browser") => real_browser_main().await,
+        Ok("sqlite-persistence") => sqlite_persistence_main().await,
+        _ => recording_main().await,
     }
-    recording_main().await
 }
 
 async fn recording_main() -> anyhow::Result<()> {
@@ -176,6 +180,120 @@ async fn recording_main() -> anyhow::Result<()> {
     }
 
     println!("docker e2e passed: controller routed to recording pwright gateway");
+    Ok(())
+}
+
+async fn sqlite_persistence_main() -> anyhow::Result<()> {
+    let root = Path::new("/tmp/bcp-sqlite-e2e");
+    if root.exists() {
+        std::fs::remove_dir_all(root)?;
+    }
+    std::fs::create_dir_all(root)?;
+
+    let controller_db = root.join("controller.sqlite");
+    let agent_db = root.join("agent.sqlite");
+    let controller_addr = "127.0.0.1:7010";
+    let agent_addr = "127.0.0.1:7110";
+    let controller_endpoint = format!("http://{controller_addr}");
+    let agent_endpoint = format!("http://{agent_addr}");
+
+    let mut controller =
+        spawn_controller(controller_addr, &controller_db).context("spawn first controller")?;
+    let mut agent = spawn_agent(agent_addr, &agent_db, &controller_endpoint, &agent_endpoint)
+        .context("spawn agent")?;
+
+    let mut global = connect_global(&controller_endpoint).await?;
+    wait_for_auto_registered_profile(&mut global, "machine-sqlite", "yt-sqlite").await?;
+
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "sqlite-e2e".to_string(),
+            purpose: "verify-sqlite-restore".to_string(),
+            platform: AccountPlatform::Youtube as i32,
+            account_id: "yt-sqlite".to_string(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 300,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("controller did not return route")?;
+    let lease = acquired.lease.context("controller did not return lease")?;
+    if route.agent_grpc_addr != agent_endpoint {
+        bail!(
+            "expected auto-registered agent addr {agent_endpoint}, got {}",
+            route.agent_grpc_addr
+        );
+    }
+
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    let mut routed_agent = connect_agent(&route.agent_grpc_addr).await?;
+    routed_agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    let snapshot = routed_agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?
+        .into_inner();
+    if snapshot.nodes.iter().all(|node| node.r#ref != "e1") {
+        bail!("sqlite e2e snapshot did not include e1");
+    }
+
+    stop_child(&mut controller, "first controller").await?;
+    let mut restored_controller =
+        spawn_controller(controller_addr, &controller_db).context("spawn restored controller")?;
+    let mut restored_global = connect_global(&controller_endpoint).await?;
+
+    let restored_route = restored_global
+        .get_route(GetRouteRequest {
+            lease_id: lease.lease_id.clone(),
+            fencing_token: lease.fencing_token.clone(),
+        })
+        .await?
+        .into_inner()
+        .route
+        .context("restored controller did not return route")?;
+    if restored_route.machine_id != "machine-sqlite" {
+        bail!(
+            "expected restored route to machine-sqlite, got {}",
+            restored_route.machine_id
+        );
+    }
+    if restored_route.agent_grpc_addr != agent_endpoint {
+        bail!(
+            "expected restored agent addr {agent_endpoint}, got {}",
+            restored_route.agent_grpc_addr
+        );
+    }
+
+    let lookup = restored_global
+        .lookup_browser_connection(LookupBrowserConnectionRequest {
+            platform: AccountPlatform::Youtube as i32,
+            account_id: "yt-sqlite".to_string(),
+            label_selector: HashMap::new(),
+            include_unavailable: true,
+        })
+        .await?
+        .into_inner();
+    if lookup.active_lease_id != lease.lease_id {
+        bail!(
+            "expected restored lookup active lease {}, got {}",
+            lease.lease_id,
+            lookup.active_lease_id
+        );
+    }
+
+    stop_child(&mut restored_controller, "restored controller").await?;
+    stop_child(&mut agent, "agent").await?;
+
+    println!("docker sqlite e2e passed: auto-registration and sqlite restore work");
     Ok(())
 }
 
@@ -375,6 +493,92 @@ async fn exercise_real_profile(
         Ok(_) => bail!("wrong real-browser agent accepted a lease that was never installed"),
     }
     Ok(())
+}
+
+fn spawn_controller(addr: &str, db_path: &Path) -> anyhow::Result<Child> {
+    let binary = std::env::var("BCP_CONTROLLER_BIN")
+        .unwrap_or_else(|_| "/usr/local/bin/bcp-controller".to_string());
+    let child = Command::new(binary)
+        .arg("--addr")
+        .arg(addr)
+        .arg("--db-path")
+        .arg(db_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(child)
+}
+
+fn spawn_agent(
+    addr: &str,
+    db_path: &Path,
+    controller_endpoint: &str,
+    agent_endpoint: &str,
+) -> anyhow::Result<Child> {
+    let binary =
+        std::env::var("BCP_AGENT_BIN").unwrap_or_else(|_| "/usr/local/bin/bcp-agent".to_string());
+    let child = Command::new(binary)
+        .arg("--addr")
+        .arg(addr)
+        .arg("--db-path")
+        .arg(db_path)
+        .env("BCP_CONTROLLER", controller_endpoint)
+        .env("BCP_CONTROLLER_REGISTER_SECONDS", "1")
+        .env("BCP_AGENT_PUBLIC_ADDR", agent_endpoint)
+        .env("BCP_MACHINE_ID", "machine-sqlite")
+        .env("BCP_E2E_PROFILE_ID", "youtube-sqlite")
+        .env("BCP_E2E_ACCOUNT_ID", "yt-sqlite")
+        .env("BCP_E2E_PLATFORM", "youtube")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    Ok(child)
+}
+
+async fn stop_child(child: &mut Child, name: &str) -> anyhow::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    child.kill().await.context(format!("kill {name}"))?;
+    let _ = child.wait().await;
+    Ok(())
+}
+
+async fn wait_for_auto_registered_profile(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    expected_machine_id: &str,
+    expected_account_id: &str,
+) -> anyhow::Result<()> {
+    let mut last_error = None;
+    for _ in 0..30 {
+        match global
+            .lookup_browser_connection(LookupBrowserConnectionRequest {
+                platform: AccountPlatform::Youtube as i32,
+                account_id: expected_account_id.to_string(),
+                label_selector: HashMap::new(),
+                include_unavailable: true,
+            })
+            .await
+        {
+            Ok(response) => {
+                let response = response.into_inner();
+                if response
+                    .route_hint
+                    .as_ref()
+                    .is_some_and(|route| route.machine_id == expected_machine_id)
+                {
+                    return Ok(());
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    match last_error {
+        Some(error) => Err(anyhow::Error::from(error))
+            .context("auto-registered profile did not become visible"),
+        None => bail!("auto-registered profile did not become visible"),
+    }
 }
 
 async fn connect_global(

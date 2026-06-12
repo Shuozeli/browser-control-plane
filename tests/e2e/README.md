@@ -28,6 +28,8 @@ routing and local lease enforcement.
 
 ## Intended Test Cases
 
+Recording topology:
+
 - Register two machine agents with different profiles from the e2e runner.
 - Acquire a YouTube account and receive a route to agent A.
 - Install the lease on agent A.
@@ -35,8 +37,19 @@ routing and local lease enforcement.
 - Verify agent A's recording gateway returns a snapshot/action success.
 - Verify agent B rejects the same lease because it was not installed there.
 
+SQLite persistence topology:
+
+- Start real controller and agent processes inside the Docker e2e runner.
+- Use SQLite files for controller and agent state.
+- Let the agent auto-register through `BCP_CONTROLLER`.
+- Acquire a lease and route browser work through the machine controller.
+- Restart the controller process with the same SQLite database.
+- Verify the restored controller can return the active lease route and lookup
+  state.
+
 ## Running
 
 ```bash
 docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit
+docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
 ```
