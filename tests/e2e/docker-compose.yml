@@ -1,0 +1,73 @@
+services:
+  controller:
+    build:
+      context: ../..
+    image: browser-control-plane:local
+    entrypoint:
+      - /usr/local/bin/bcp-controller
+    command:
+      - --addr
+      - 0.0.0.0:7000
+    networks:
+      k3s-pod-net:
+        aliases:
+          - controller
+
+  agent-a:
+    build:
+      context: ../..
+    image: browser-control-plane:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-a
+      BCP_E2E_PROFILE_ID: youtube-main
+      BCP_E2E_ACCOUNT_ID: yt-main
+      BCP_E2E_PLATFORM: youtube
+    networks:
+      k3s-pod-net:
+        aliases:
+          - agent-a
+
+  agent-b:
+    build:
+      context: ../..
+    image: browser-control-plane:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-b
+      BCP_E2E_PROFILE_ID: x-news
+      BCP_E2E_ACCOUNT_ID: x-news
+      BCP_E2E_PLATFORM: x
+    networks:
+      k3s-pod-net:
+        aliases:
+          - agent-b
+
+  e2e-client:
+    build:
+      context: ../..
+    image: browser-control-plane:local
+    entrypoint:
+      - /usr/local/bin/bcp-e2e
+    command:
+      []
+    environment:
+      BCP_CONTROLLER: http://controller:7000
+    depends_on:
+      - controller
+      - agent-a
+      - agent-b
+    networks:
+      k3s-pod-net:
+
+networks:
+  k3s-pod-net:
+    name: browser-control-plane-k3s

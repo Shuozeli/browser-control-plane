@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bcp-core",
+    "crates/bcp-proto",
+    "crates/bcp-controller",
+    "crates/bcp-agent",
+    "crates/bcp-client",
+    "crates/bcp-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Shuozeli/browser-control-plane"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+prost = "0.13"
+prost-build = "0.13"
+pwright-bridge = { git = "https://github.com/Shuozeli/pwright.git", package = "pwright-bridge" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.13"
+tonic-build = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+bcp-core = { path = "crates/bcp-core" }
+bcp-proto = { path = "crates/bcp-proto" }

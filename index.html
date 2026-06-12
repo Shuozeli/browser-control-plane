@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Control Plane Proposal</title>
+    <style>
+      :root {
+        --bg: #f4f6f8;
+        --surface: #ffffff;
+        --surface-2: #eef3f6;
+        --text: #17202a;
+        --muted: #5c6672;
+        --line: #d7dee7;
+        --blue: #176b87;
+        --green: #24724f;
+        --amber: #9b5c00;
+        --red: #9a3c3c;
+        --ink: #25313d;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      header {
+        background: var(--surface);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .wrap {
+        width: min(1220px, calc(100vw - 40px));
+        margin: 0 auto;
+      }
+
+      .header-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 24px 0;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        margin-bottom: 6px;
+        font-size: 28px;
+        line-height: 1.15;
+        font-weight: 760;
+      }
+
+      h2 {
+        margin-bottom: 14px;
+        font-size: 18px;
+        line-height: 1.3;
+      }
+
+      h3 {
+        margin-bottom: 8px;
+        font-size: 14px;
+        line-height: 1.35;
+      }
+
+      p {
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .eyebrow {
+        margin-bottom: 6px;
+        color: var(--blue);
+        font-size: 12px;
+        font-weight: 760;
+        text-transform: uppercase;
+      }
+
+      .subtitle {
+        margin: 0;
+        max-width: 760px;
+        font-size: 15px;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        height: 32px;
+        padding: 0 11px;
+        border: 1px solid var(--line);
+        background: #eef7f8;
+        color: var(--blue);
+        font-size: 13px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      main {
+        padding: 24px 0 44px;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 260px minmax(0, 1fr);
+        gap: 18px;
+      }
+
+      nav,
+      section {
+        background: var(--surface);
+        border: 1px solid var(--line);
+      }
+
+      nav {
+        align-self: start;
+        position: sticky;
+        top: 14px;
+        padding: 14px;
+      }
+
+      nav a {
+        display: block;
+        padding: 9px 10px;
+        color: var(--ink);
+        text-decoration: none;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      nav a:hover {
+        background: var(--surface-2);
+      }
+
+      section {
+        padding: 18px;
+        margin-bottom: 18px;
+      }
+
+      .two {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+
+      .three {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .tile {
+        border: 1px solid var(--line);
+        background: #fbfcfd;
+        padding: 14px;
+        min-height: 128px;
+      }
+
+      .tile p {
+        margin-bottom: 0;
+        font-size: 13px;
+      }
+
+      .diagram {
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        background: #fbfcfd;
+      }
+
+      svg {
+        display: block;
+        min-width: 850px;
+        width: 100%;
+        height: auto;
+      }
+
+      .node {
+        fill: #ffffff;
+        stroke: #99a8b8;
+        stroke-width: 1.2;
+      }
+
+      .node-blue {
+        fill: #eaf5f8;
+        stroke: var(--blue);
+      }
+
+      .node-green {
+        fill: #eaf6f0;
+        stroke: var(--green);
+      }
+
+      .node-amber {
+        fill: #fff4df;
+        stroke: var(--amber);
+      }
+
+      .arrow {
+        stroke: #536273;
+        stroke-width: 1.5;
+        marker-end: url(#arrow);
+      }
+
+      .dash {
+        stroke-dasharray: 5 5;
+      }
+
+      .svg-title {
+        fill: var(--text);
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .svg-text {
+        fill: var(--muted);
+        font-size: 12px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        padding: 10px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 700;
+      }
+
+      code {
+        font-family:
+          "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.94em;
+      }
+
+      .status {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        padding: 0 8px;
+        background: #eaf6f0;
+        color: var(--green);
+        font-size: 12px;
+        font-weight: 720;
+      }
+
+      .warn {
+        background: #fff4df;
+        color: var(--amber);
+      }
+
+      .links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .links a {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 11px;
+        border: 1px solid var(--line);
+        color: var(--blue);
+        text-decoration: none;
+        font-weight: 700;
+        font-size: 13px;
+      }
+
+      .links a:hover {
+        background: var(--surface-2);
+      }
+
+      @media (max-width: 900px) {
+        .layout,
+        .two,
+        .three {
+          grid-template-columns: 1fr;
+        }
+
+        nav {
+          position: static;
+        }
+
+        .header-row {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="wrap header-row">
+        <div>
+          <div class="eyebrow">Proposal</div>
+          <h1>Browser Fleet Control Plane</h1>
+          <p class="subtitle">
+            A two-layer Rust gRPC system for routing browser automation across
+            many machines, Chrome profiles, and logged-in platform accounts.
+          </p>
+        </div>
+        <span class="badge">Tailscale-first operator surface</span>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <div class="layout">
+        <nav>
+          <a href="#summary">Summary</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#routing">Routing Flow</a>
+          <a href="#lease">Lease Model</a>
+          <a href="#machine">Machine Controller</a>
+          <a href="#html">HTML Console</a>
+          <a href="#docs">Documents</a>
+        </nav>
+
+        <div>
+          <section id="summary">
+            <h2>What We Are Building</h2>
+            <div class="three">
+              <div class="tile">
+                <h3>Global Controller</h3>
+                <p>
+                  Owns registry, account-to-profile mapping, routing decisions,
+                  machine heartbeat, and leases. It does not execute browser
+                  actions.
+                </p>
+              </div>
+              <div class="tile">
+                <h3>Machine Controller</h3>
+                <p>
+                  Runs once per computer. It manages local Chrome instances,
+                  profile paths, CDP ports, health checks, and browser proxying.
+                </p>
+              </div>
+              <div class="tile">
+                <h3>Client</h3>
+                <p>
+                  Asks the global controller for a route and lease, then sends
+                  browser work to the selected machine controller.
+                </p>
+              </div>
+            </div>
+          </section>
+
+          <section id="architecture">
+            <h2>Architecture</h2>
+            <div class="diagram">
+              <svg viewBox="0 0 980 360" role="img" aria-label="Architecture diagram">
+                <defs>
+                  <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <path d="M0,0 L0,6 L9,3 z" fill="#536273"></path>
+                  </marker>
+                </defs>
+
+                <rect class="node node-blue" x="40" y="130" width="150" height="76" rx="4"></rect>
+                <text class="svg-title" x="115" y="160" text-anchor="middle">Clients</text>
+                <text class="svg-text" x="115" y="181" text-anchor="middle">CLI / SDK / jobs</text>
+
+                <rect class="node node-amber" x="310" y="58" width="220" height="104" rx="4"></rect>
+                <text class="svg-title" x="420" y="92" text-anchor="middle">Global Controller</text>
+                <text class="svg-text" x="420" y="116" text-anchor="middle">registry / routing / lease</text>
+                <text class="svg-text" x="420" y="137" text-anchor="middle">Postgres-backed truth</text>
+
+                <rect class="node node-green" x="680" y="42" width="220" height="90" rx="4"></rect>
+                <text class="svg-title" x="790" y="74" text-anchor="middle">Machine Controller A</text>
+                <text class="svg-text" x="790" y="98" text-anchor="middle">local Chrome proxy</text>
+
+                <rect class="node node-green" x="680" y="216" width="220" height="90" rx="4"></rect>
+                <text class="svg-title" x="790" y="248" text-anchor="middle">Machine Controller B</text>
+                <text class="svg-text" x="790" y="272" text-anchor="middle">local Chrome proxy</text>
+
+                <rect class="node" x="700" y="146" width="82" height="42" rx="4"></rect>
+                <text class="svg-text" x="741" y="172" text-anchor="middle">Chrome 1</text>
+                <rect class="node" x="800" y="146" width="82" height="42" rx="4"></rect>
+                <text class="svg-text" x="841" y="172" text-anchor="middle">Chrome 2</text>
+                <rect class="node" x="700" y="320" width="82" height="32" rx="4"></rect>
+                <text class="svg-text" x="741" y="341" text-anchor="middle">Chrome 3</text>
+                <rect class="node" x="800" y="320" width="82" height="32" rx="4"></rect>
+                <text class="svg-text" x="841" y="341" text-anchor="middle">Chrome 4</text>
+
+                <line class="arrow" x1="190" y1="153" x2="310" y2="113"></line>
+                <text class="svg-text" x="250" y="119" text-anchor="middle">AcquireBrowser</text>
+
+                <line class="arrow" x1="310" y1="142" x2="190" y2="178"></line>
+                <text class="svg-text" x="250" y="178" text-anchor="middle">route + lease</text>
+
+                <line class="arrow dash" x1="530" y1="91" x2="680" y2="84"></line>
+                <text class="svg-text" x="606" y="72" text-anchor="middle">heartbeat</text>
+
+                <line class="arrow dash" x1="530" y1="137" x2="680" y2="246"></line>
+                <text class="svg-text" x="608" y="215" text-anchor="middle">heartbeat</text>
+
+                <line class="arrow" x1="190" y1="192" x2="680" y2="252"></line>
+                <text class="svg-text" x="420" y="238" text-anchor="middle">browser work with lease</text>
+
+                <line class="arrow" x1="790" y1="132" x2="790" y2="146"></line>
+                <line class="arrow" x1="790" y1="306" x2="790" y2="320"></line>
+              </svg>
+            </div>
+          </section>
+
+          <section id="routing">
+            <h2>Routing Flow</h2>
+            <div class="diagram">
+              <svg viewBox="0 0 980 300" role="img" aria-label="Routing flow diagram">
+                <defs>
+                  <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <path d="M0,0 L0,6 L9,3 z" fill="#536273"></path>
+                  </marker>
+                </defs>
+                <g>
+                  <rect class="node node-blue" x="38" y="110" width="126" height="70" rx="4"></rect>
+                  <text class="svg-title" x="101" y="140" text-anchor="middle">Client</text>
+                  <text class="svg-text" x="101" y="160" text-anchor="middle">needs account</text>
+                </g>
+                <g>
+                  <rect class="node node-amber" x="250" y="50" width="180" height="70" rx="4"></rect>
+                  <text class="svg-title" x="340" y="80" text-anchor="middle">Select Profile</text>
+                  <text class="svg-text" x="340" y="100" text-anchor="middle">platform/account/labels</text>
+                </g>
+                <g>
+                  <rect class="node node-amber" x="250" y="180" width="180" height="70" rx="4"></rect>
+                  <text class="svg-title" x="340" y="210" text-anchor="middle">Create Lease</text>
+                  <text class="svg-text" x="340" y="230" text-anchor="middle">exclusive + TTL</text>
+                </g>
+                <g>
+                  <rect class="node node-green" x="525" y="110" width="176" height="70" rx="4"></rect>
+                  <text class="svg-title" x="613" y="140" text-anchor="middle">Return Route</text>
+                  <text class="svg-text" x="613" y="160" text-anchor="middle">agent addr + token</text>
+                </g>
+                <g>
+                  <rect class="node node-green" x="790" y="110" width="150" height="70" rx="4"></rect>
+                  <text class="svg-title" x="865" y="140" text-anchor="middle">Machine Agent</text>
+                  <text class="svg-text" x="865" y="160" text-anchor="middle">executes browser work</text>
+                </g>
+
+                <line class="arrow" style="marker-end:url(#arrow2)" x1="164" y1="132" x2="250" y2="92"></line>
+                <line class="arrow" style="marker-end:url(#arrow2)" x1="340" y1="120" x2="340" y2="180"></line>
+                <line class="arrow" style="marker-end:url(#arrow2)" x1="430" y1="214" x2="525" y2="158"></line>
+                <line class="arrow" style="marker-end:url(#arrow2)" x1="701" y1="145" x2="790" y2="145"></line>
+                <line class="arrow" style="marker-end:url(#arrow2)" x1="525" y1="128" x2="164" y2="128"></line>
+              </svg>
+            </div>
+          </section>
+
+          <section id="lease">
+            <h2>Lease State Model</h2>
+            <div class="two">
+              <div class="diagram">
+                <svg viewBox="0 0 520 270" role="img" aria-label="Lease state diagram">
+                  <defs>
+                    <marker id="arrow3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                      <path d="M0,0 L0,6 L9,3 z" fill="#536273"></path>
+                    </marker>
+                  </defs>
+                  <rect class="node node-green" x="35" y="98" width="110" height="54" rx="4"></rect>
+                  <text class="svg-title" x="90" y="131" text-anchor="middle">Available</text>
+                  <rect class="node node-amber" x="205" y="34" width="110" height="54" rx="4"></rect>
+                  <text class="svg-title" x="260" y="67" text-anchor="middle">Launching</text>
+                  <rect class="node node-blue" x="205" y="162" width="110" height="54" rx="4"></rect>
+                  <text class="svg-title" x="260" y="195" text-anchor="middle">Leased</text>
+                  <rect class="node" x="375" y="98" width="110" height="54" rx="4"></rect>
+                  <text class="svg-title" x="430" y="131" text-anchor="middle">Expired</text>
+                  <rect class="node node-amber" x="375" y="198" width="110" height="54" rx="4"></rect>
+                  <text class="svg-title" x="430" y="231" text-anchor="middle">Quarantine</text>
+                  <line class="arrow" style="marker-end:url(#arrow3)" x1="145" y1="110" x2="205" y2="74"></line>
+                  <line class="arrow" style="marker-end:url(#arrow3)" x1="260" y1="88" x2="260" y2="162"></line>
+                  <line class="arrow" style="marker-end:url(#arrow3)" x1="315" y1="188" x2="375" y2="135"></line>
+                  <line class="arrow" style="marker-end:url(#arrow3)" x1="375" y1="121" x2="145" y2="121"></line>
+                  <line class="arrow" style="marker-end:url(#arrow3)" x1="315" y1="205" x2="375" y2="224"></line>
+                </svg>
+              </div>
+              <div>
+                <p>
+                  Every browser operation carries <code>lease_id</code>,
+                  <code>profile_id</code>, and <code>fencing_token</code>. The
+                  machine controller validates these before touching Chrome.
+                </p>
+                <table>
+                  <tr>
+                    <th>Rule</th>
+                    <th>Reason</th>
+                  </tr>
+                  <tr>
+                    <td>One profile, one active lease</td>
+                    <td>Prevents two jobs from operating the same account.</td>
+                  </tr>
+                  <tr>
+                    <td>Fencing token required</td>
+                    <td>Rejects stale delayed requests after lease renewal.</td>
+                  </tr>
+                  <tr>
+                    <td>Machine validates locally</td>
+                    <td>Do not trust client-side routing data alone.</td>
+                  </tr>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section id="machine">
+            <h2>Machine Controller Responsibilities</h2>
+            <table>
+              <thead>
+                <tr>
+                  <th>Area</th>
+                  <th>Responsibility</th>
+                  <th>Storage</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Profiles</td>
+                  <td>Map profile IDs to local Chrome profile paths.</td>
+                  <td>SQLite</td>
+                </tr>
+                <tr>
+                  <td>Runtime</td>
+                  <td>Launch, stop, and health-check Chrome instances.</td>
+                  <td>SQLite + process table</td>
+                </tr>
+                <tr>
+                  <td>Ports</td>
+                  <td>Allocate CDP ports from a configured local range.</td>
+                  <td>SQLite</td>
+                </tr>
+                <tr>
+                  <td>Proxy</td>
+                  <td>Execute snapshot, action, evaluate, and scripts.</td>
+                  <td>pwright bridge</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section id="html">
+            <h2>HTML Console Proposal</h2>
+            <div class="two">
+              <div class="tile">
+                <h3>Serve Model</h3>
+                <p>
+                  The global controller serves a Tailscale-only operator UI at
+                  <code>$TAILSCALE_IP:7080</code> and advertises the full
+                  MagicDNS URL.
+                </p>
+              </div>
+              <div class="tile">
+                <h3>Scope</h3>
+                <p>
+                  The UI is for understanding fleet state and debugging routes.
+                  It is not the browser automation API and it does not expose
+                  raw CDP endpoints.
+                </p>
+              </div>
+            </div>
+            <table style="margin-top: 14px">
+              <tr>
+                <th>View</th>
+                <th>Shows</th>
+                <th>First Phase</th>
+              </tr>
+              <tr>
+                <td>Fleet</td>
+                <td>Machines, status, heartbeats, labels.</td>
+                <td><span class="status">Read-only</span></td>
+              </tr>
+              <tr>
+                <td>Profiles</td>
+                <td>Profile path, owning machine, account mapping.</td>
+                <td><span class="status">Read-only</span></td>
+              </tr>
+              <tr>
+                <td>Routes</td>
+                <td>Dry-run route selection and rejection reasons.</td>
+                <td><span class="warn status">Phase 2</span></td>
+              </tr>
+              <tr>
+                <td>Leases</td>
+                <td>Lease owner, purpose, expiry, fencing token fingerprint.</td>
+                <td><span class="warn status">Phase 3</span></td>
+              </tr>
+            </table>
+          </section>
+
+          <section id="docs">
+            <h2>Design Documents</h2>
+            <p>
+              These markdown files are the source documents behind this visual
+              proposal.
+            </p>
+            <div class="links">
+              <a href="/docs/architecture.md">Architecture</a>
+              <a href="/docs/design.md">Control Plane Design</a>
+              <a href="/docs/html-serve-design.md">HTML Serve Design</a>
+              <a href="/docs/tasks.md">Tasks</a>
+              <a href="/proto/browsercontrol/v1/control_plane.proto">Proto</a>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+target/
+.git/
+.bcp/
+*.db
+*.sqlite
+*.log

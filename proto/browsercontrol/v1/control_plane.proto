@@ -1,0 +1,509 @@
+syntax = "proto3";
+
+package browsercontrol.v1;
+
+// GlobalController is the fleet-level control plane. It owns machine/profile
+// registry, routing, and leases. It does not directly speak Chrome CDP.
+service GlobalController {
+  rpc RegisterMachine(RegisterMachineRequest) returns (RegisterMachineResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc ListBrowserAccountBindings(ListBrowserAccountBindingsRequest) returns (ListBrowserAccountBindingsResponse);
+  rpc LookupBrowserConnection(LookupBrowserConnectionRequest) returns (LookupBrowserConnectionResponse);
+
+  rpc AcquireBrowser(AcquireBrowserRequest) returns (AcquireBrowserResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
+  rpc GetRoute(GetRouteRequest) returns (GetRouteResponse);
+
+  rpc ReportTelemetry(ReportTelemetryRequest) returns (ReportTelemetryResponse);
+  rpc GetMetricSummary(GetMetricSummaryRequest) returns (GetMetricSummaryResponse);
+  rpc ListControlPlaneEvents(ListControlPlaneEventsRequest) returns (ListControlPlaneEventsResponse);
+  rpc ReportArtifacts(ReportArtifactsRequest) returns (ReportArtifactsResponse);
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+}
+
+// MachineController runs once per machine. Clients execute browser work through
+// this local proxy after the global controller grants a lease and route.
+service MachineController {
+  rpc InstallLease(InstallLeaseRequest) returns (InstallLeaseResponse);
+  rpc ListLocalProfiles(ListLocalProfilesRequest) returns (ListLocalProfilesResponse);
+  rpc EnsureBrowser(EnsureBrowserRequest) returns (EnsureBrowserResponse);
+  rpc StopBrowser(StopBrowserRequest) returns (StopBrowserResponse);
+  rpc CheckBrowser(CheckBrowserRequest) returns (CheckBrowserResponse);
+
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+  rpc RunScript(RunScriptRequest) returns (stream RunScriptResponse);
+
+  rpc UploadArtifact(stream UploadArtifactRequest) returns (UploadArtifactResponse);
+  rpc ListLocalArtifacts(ListLocalArtifactsRequest) returns (ListLocalArtifactsResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+}
+
+enum MachineStatus {
+  MACHINE_STATUS_UNSPECIFIED = 0;
+  MACHINE_STATUS_ONLINE = 1;
+  MACHINE_STATUS_DEGRADED = 2;
+  MACHINE_STATUS_OFFLINE = 3;
+}
+
+enum ProfileStatus {
+  PROFILE_STATUS_UNSPECIFIED = 0;
+  PROFILE_STATUS_AVAILABLE = 1;
+  PROFILE_STATUS_LEASED = 2;
+  PROFILE_STATUS_LAUNCHING = 3;
+  PROFILE_STATUS_BROKEN = 4;
+  PROFILE_STATUS_QUARANTINED = 5;
+}
+
+enum AccountPlatform {
+  ACCOUNT_PLATFORM_UNSPECIFIED = 0;
+  ACCOUNT_PLATFORM_YOUTUBE = 1;
+  ACCOUNT_PLATFORM_X = 2;
+  ACCOUNT_PLATFORM_DOUYIN = 3;
+  ACCOUNT_PLATFORM_TIKTOK = 4;
+  ACCOUNT_PLATFORM_REDDIT = 5;
+  ACCOUNT_PLATFORM_ZHIHU = 6;
+  ACCOUNT_PLATFORM_WEIBO = 7;
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_COUNTER = 1;
+  METRIC_KIND_GAUGE = 2;
+}
+
+enum EventSeverity {
+  EVENT_SEVERITY_UNSPECIFIED = 0;
+  EVENT_SEVERITY_INFO = 1;
+  EVENT_SEVERITY_WARN = 2;
+  EVENT_SEVERITY_ERROR = 3;
+}
+
+enum ArtifactStatus {
+  ARTIFACT_STATUS_UNSPECIFIED = 0;
+  ARTIFACT_STATUS_UPLOADING = 1;
+  ARTIFACT_STATUS_AVAILABLE = 2;
+  ARTIFACT_STATUS_EXPIRED = 3;
+  ARTIFACT_STATUS_DELETED = 4;
+  ARTIFACT_STATUS_FAILED = 5;
+}
+
+message Machine {
+  string machine_id = 1;
+  string hostname = 2;
+  string tailscale_host = 3;
+  string agent_grpc_addr = 4;
+  MachineStatus status = 5;
+  map<string, string> labels = 6;
+  int64 last_heartbeat_unix_ms = 7;
+}
+
+message BrowserProfile {
+  string profile_id = 1;
+  string machine_id = 2;
+  string profile_path = 3;
+  string display_name = 4;
+  ProfileStatus status = 5;
+  string cdp_url = 6;
+  int32 cdp_port = 7;
+  repeated Account accounts = 8;
+  map<string, string> labels = 9;
+  int64 last_seen_unix_ms = 10;
+}
+
+message Account {
+  string account_id = 1;
+  AccountPlatform platform = 2;
+  string handle = 3;
+  string health = 4;
+  repeated string capabilities = 5;
+}
+
+message BrowserLease {
+  string lease_id = 1;
+  string profile_id = 2;
+  string machine_id = 3;
+  string client_id = 4;
+  string purpose = 5;
+  string fencing_token = 6;
+  int64 expires_at_unix_ms = 7;
+}
+
+message BrowserRoute {
+  string machine_id = 1;
+  string agent_grpc_addr = 2;
+  string profile_id = 3;
+  string lease_id = 4;
+  string fencing_token = 5;
+}
+
+message BrowserAccountBinding {
+  string binding_id = 1;
+  string profile_id = 2;
+  string machine_id = 3;
+  AccountPlatform platform = 4;
+  string account_id = 5;
+  string handle = 6;
+  string account_health = 7;
+  ProfileStatus profile_status = 8;
+  string agent_grpc_addr = 9;
+  string cdp_url = 10;
+  int64 last_seen_unix_ms = 11;
+}
+
+message RegisterMachineRequest {
+  Machine machine = 1;
+  repeated BrowserProfile profiles = 2;
+}
+
+message RegisterMachineResponse {
+  string machine_id = 1;
+  bool accepted = 2;
+}
+
+message HeartbeatRequest {
+  string machine_id = 1;
+  MachineStatus status = 2;
+  repeated BrowserProfile profiles = 3;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  int32 heartbeat_after_seconds = 2;
+}
+
+message ListMachinesRequest {
+  map<string, string> label_selector = 1;
+}
+
+message ListMachinesResponse {
+  repeated Machine machines = 1;
+}
+
+message ListProfilesRequest {
+  AccountPlatform platform = 1;
+  string account_id = 2;
+  map<string, string> label_selector = 3;
+  bool include_unavailable = 4;
+}
+
+message ListProfilesResponse {
+  repeated BrowserProfile profiles = 1;
+}
+
+message ListBrowserAccountBindingsRequest {
+  AccountPlatform platform = 1;
+  string account_id = 2;
+  string machine_id = 3;
+  string profile_id = 4;
+  bool include_unavailable = 5;
+}
+
+message ListBrowserAccountBindingsResponse {
+  repeated BrowserAccountBinding bindings = 1;
+}
+
+message LookupBrowserConnectionRequest {
+  AccountPlatform platform = 1;
+  string account_id = 2;
+  map<string, string> label_selector = 3;
+  bool include_unavailable = 4;
+}
+
+message LookupBrowserConnectionResponse {
+  BrowserAccountBinding binding = 1;
+  BrowserRoute route_hint = 2;
+  string active_lease_id = 3;
+  bool available = 4;
+  string connection_state = 5;
+  int64 active_lease_expires_at_unix_ms = 6;
+}
+
+message AcquireBrowserRequest {
+  string client_id = 1;
+  string purpose = 2;
+  AccountPlatform platform = 3;
+  string account_id = 4;
+  map<string, string> label_selector = 5;
+  int64 ttl_seconds = 6;
+}
+
+message AcquireBrowserResponse {
+  BrowserLease lease = 1;
+  BrowserRoute route = 2;
+}
+
+message RenewLeaseRequest {
+  string lease_id = 1;
+  string fencing_token = 2;
+  int64 ttl_seconds = 3;
+}
+
+message RenewLeaseResponse {
+  BrowserLease lease = 1;
+}
+
+message ReleaseLeaseRequest {
+  string lease_id = 1;
+  string fencing_token = 2;
+}
+
+message ReleaseLeaseResponse {
+  bool released = 1;
+}
+
+message GetRouteRequest {
+  string lease_id = 1;
+  string fencing_token = 2;
+}
+
+message GetRouteResponse {
+  BrowserRoute route = 1;
+}
+
+message MetricSample {
+  string name = 1;
+  MetricKind kind = 2;
+  int64 observed_at_unix_ms = 3;
+  string machine_id = 4;
+  string profile_id = 5;
+  AccountPlatform platform = 6;
+  string domain = 7;
+  string action = 8;
+  string status_class = 9;
+  string error_class = 10;
+  double value = 11;
+}
+
+message ControlPlaneEvent {
+  string event_id = 1;
+  string event_type = 2;
+  EventSeverity severity = 3;
+  int64 observed_at_unix_ms = 4;
+  string machine_id = 5;
+  string profile_id = 6;
+  AccountPlatform platform = 7;
+  string message = 8;
+  map<string, string> attributes = 9;
+}
+
+message ReportTelemetryRequest {
+  string reporter_machine_id = 1;
+  repeated MetricSample samples = 2;
+  repeated ControlPlaneEvent events = 3;
+}
+
+message ReportTelemetryResponse {
+  int32 accepted_samples = 1;
+  int32 accepted_events = 2;
+}
+
+message GetMetricSummaryRequest {
+  string name = 1;
+  int64 start_unix_ms = 2;
+  int64 end_unix_ms = 3;
+  string machine_id = 4;
+  string profile_id = 5;
+  AccountPlatform platform = 6;
+  string domain = 7;
+}
+
+message MetricPoint {
+  string name = 1;
+  int64 bucket_start_unix_ms = 2;
+  string machine_id = 3;
+  string profile_id = 4;
+  AccountPlatform platform = 5;
+  string domain = 6;
+  string action = 7;
+  string status_class = 8;
+  string error_class = 9;
+  double value = 10;
+}
+
+message GetMetricSummaryResponse {
+  repeated MetricPoint points = 1;
+}
+
+message ListControlPlaneEventsRequest {
+  int64 start_unix_ms = 1;
+  int64 end_unix_ms = 2;
+  string machine_id = 3;
+  string profile_id = 4;
+  int32 limit = 5;
+}
+
+message ListControlPlaneEventsResponse {
+  repeated ControlPlaneEvent events = 1;
+}
+
+message Artifact {
+  string artifact_id = 1;
+  string machine_id = 2;
+  string lease_id = 3;
+  string profile_id = 4;
+  string original_filename = 5;
+  string stored_filename = 6;
+  string content_type = 7;
+  string purpose = 8;
+  int64 size_bytes = 9;
+  int64 uploaded_at_unix_ms = 10;
+  int64 expires_at_unix_ms = 11;
+  ArtifactStatus status = 12;
+}
+
+message ReportArtifactsRequest {
+  string reporter_machine_id = 1;
+  repeated Artifact artifacts = 2;
+}
+
+message ReportArtifactsResponse {
+  int32 accepted_artifacts = 1;
+}
+
+message ListArtifactsRequest {
+  string machine_id = 1;
+  string profile_id = 2;
+  string lease_id = 3;
+  bool include_expired = 4;
+}
+
+message ListArtifactsResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message LeaseContext {
+  string lease_id = 1;
+  string profile_id = 2;
+  string fencing_token = 3;
+}
+
+message InstallLeaseRequest {
+  LeaseContext lease = 1;
+}
+
+message InstallLeaseResponse {
+  bool installed = 1;
+}
+
+message ListLocalProfilesRequest {}
+
+message ListLocalProfilesResponse {
+  repeated BrowserProfile profiles = 1;
+}
+
+message EnsureBrowserRequest {
+  LeaseContext lease = 1;
+}
+
+message EnsureBrowserResponse {
+  BrowserProfile profile = 1;
+}
+
+message StopBrowserRequest {
+  LeaseContext lease = 1;
+}
+
+message StopBrowserResponse {
+  bool stopped = 1;
+}
+
+message CheckBrowserRequest {
+  LeaseContext lease = 1;
+}
+
+message CheckBrowserResponse {
+  bool healthy = 1;
+  string message = 2;
+}
+
+message GetSnapshotRequest {
+  LeaseContext lease = 1;
+}
+
+message A11yNode {
+  string ref = 1;
+  string role = 2;
+  string name = 3;
+  int32 depth = 4;
+  string value = 5;
+}
+
+message GetSnapshotResponse {
+  repeated A11yNode nodes = 1;
+}
+
+message ExecuteActionRequest {
+  LeaseContext lease = 1;
+  string action = 2;
+  string ref = 3;
+  string text = 4;
+  string key = 5;
+  map<string, string> options = 6;
+}
+
+message ExecuteActionResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message EvaluateRequest {
+  LeaseContext lease = 1;
+  string expression = 2;
+}
+
+message EvaluateResponse {
+  string json_result = 1;
+}
+
+message RunScriptRequest {
+  LeaseContext lease = 1;
+  string yaml = 2;
+  map<string, string> params = 3;
+}
+
+message RunScriptResponse {
+  string json_line = 1;
+}
+
+message UploadArtifactMetadata {
+  LeaseContext lease = 1;
+  string original_filename = 2;
+  string content_type = 3;
+  string purpose = 4;
+  int64 ttl_seconds = 5;
+}
+
+message UploadArtifactRequest {
+  oneof part {
+    UploadArtifactMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadArtifactResponse {
+  Artifact artifact = 1;
+}
+
+message ListLocalArtifactsRequest {
+  string profile_id = 1;
+  string lease_id = 2;
+  bool include_expired = 3;
+}
+
+message ListLocalArtifactsResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message DeleteArtifactRequest {
+  string artifact_id = 1;
+}
+
+message DeleteArtifactResponse {
+  bool deleted = 1;
+}

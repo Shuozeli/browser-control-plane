@@ -1,0 +1,168 @@
+x-bcp-build: &bcp-build
+  context: ../..
+  dockerfile: Dockerfile.e2e
+
+services:
+  controller:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-controller
+    command:
+      - --addr
+      - 0.0.0.0:7000
+    networks:
+      control-net:
+        aliases:
+          - controller
+
+  site-a:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./static:/usr/share/nginx/html:ro
+    networks:
+      machine-a-net:
+        aliases:
+          - site-a
+
+  site-b:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./static:/usr/share/nginx/html:ro
+    networks:
+      machine-b-net:
+        aliases:
+          - site-b
+
+  chrome-a1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.11
+        aliases:
+          - chrome-a1
+
+  chrome-a2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.12
+        aliases:
+          - chrome-a2
+
+  chrome-a3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.31.10.13
+        aliases:
+          - chrome-a3
+
+  chrome-b1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.11
+        aliases:
+          - chrome-b1
+
+  chrome-b2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.12
+        aliases:
+          - chrome-b2
+
+  chrome-b3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.31.20.13
+        aliases:
+          - chrome-b3
+
+  agent-a:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-a
+      BCP_REAL_PROFILES: >-
+        yt-a-1|yt-a-1|youtube|http://172.31.10.11:9222|http://site-a/page.html?machine=machine-a&profile=yt-a-1;
+        x-a-2|x-a-2|x|http://172.31.10.12:9222|http://site-a/page.html?machine=machine-a&profile=x-a-2;
+        douyin-a-3|douyin-a-3|douyin|http://172.31.10.13:9222|http://site-a/page.html?machine=machine-a&profile=douyin-a-3
+    depends_on:
+      - chrome-a1
+      - chrome-a2
+      - chrome-a3
+      - site-a
+    networks:
+      control-net:
+        aliases:
+          - agent-a
+      machine-a-net:
+
+  agent-b:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-b
+      BCP_REAL_PROFILES: >-
+        yt-b-1|yt-b-1|youtube|http://172.31.20.11:9222|http://site-b/page.html?machine=machine-b&profile=yt-b-1;
+        x-b-2|x-b-2|x|http://172.31.20.12:9222|http://site-b/page.html?machine=machine-b&profile=x-b-2;
+        douyin-b-3|douyin-b-3|douyin|http://172.31.20.13:9222|http://site-b/page.html?machine=machine-b&profile=douyin-b-3
+    depends_on:
+      - chrome-b1
+      - chrome-b2
+      - chrome-b3
+      - site-b
+    networks:
+      control-net:
+        aliases:
+          - agent-b
+      machine-b-net:
+
+  e2e-client:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-e2e
+    environment:
+      BCP_CONTROLLER: http://controller:7000
+      BCP_E2E_MODE: real-browser
+    depends_on:
+      - controller
+      - agent-a
+      - agent-b
+    networks:
+      control-net:
+
+networks:
+  control-net:
+    name: browser-control-plane-real-control
+  machine-a-net:
+    name: browser-control-plane-real-machine-a
+    ipam:
+      config:
+        - subnet: 172.31.10.0/24
+  machine-b-net:
+    name: browser-control-plane-real-machine-b
+    ipam:
+      config:
+        - subnet: 172.31.20.0/24

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Control Plane E2E</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 32px;
+      }
+      main {
+        max-width: 720px;
+      }
+      button {
+        font: inherit;
+        padding: 10px 14px;
+      }
+      output {
+        display: block;
+        margin-top: 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="title"></h1>
+      <p id="machine"></p>
+      <button id="mark" type="button"></button>
+      <output id="result">idle</output>
+    </main>
+    <script>
+      const params = new URLSearchParams(location.search);
+      const profile = params.get("profile") || "unknown-profile";
+      const machine = params.get("machine") || "unknown-machine";
+      document.title = `BCP ${profile}`;
+      document.getElementById("title").textContent = `Profile ${profile}`;
+      document.getElementById("machine").textContent = `Machine ${machine}`;
+      document.getElementById("mark").textContent = `Mark ${profile} done`;
+      document.getElementById("mark").addEventListener("click", () => {
+        document.body.dataset.clicked = profile;
+        document.getElementById("result").textContent = `clicked ${profile}`;
+      });
+    </script>
+  </body>
+</html>

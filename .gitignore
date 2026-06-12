@@ -1,0 +1,7 @@
+/target/
+/.env
+/.bcp/
+**/.bcp/
+*.db
+*.sqlite
+*.log

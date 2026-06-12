@@ -1,0 +1,24 @@
+[package]
+name = "bcp-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bcp-core.workspace = true
+bcp-proto.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = []
+real-pwright = ["bcp-core/real-pwright"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
