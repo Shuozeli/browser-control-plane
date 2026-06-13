@@ -28,6 +28,7 @@ Default processes:
 | Process | Binary | Default bind | Purpose |
 | --- | --- | --- | --- |
 | Global controller | `bcp-controller` | `$TAILSCALE_IP:7000` | Fleet registry, account lookup, routing, leases |
+| Controller web UI | `bcp-controller` | `$TAILSCALE_IP:7080` | Read-only fleet dashboard and JSON snapshot |
 | Machine controller | `bcp-agent` | `$TAILSCALE_IP:7100` | Local browser lifecycle, lease validation, pwright/CDP proxy |
 | CLI | `bcp-client` | n/a | Operator/client lookup commands |
 
@@ -73,6 +74,16 @@ export TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
 export TAILSCALE_HOST=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName' | sed 's/\.$//')
 cargo run --release -p bcp-controller -- --addr ${TAILSCALE_IP:-0.0.0.0}:7000
 ```
+
+The controller also starts a read-only native web UI by default:
+
+```bash
+open "http://${TAILSCALE_HOST:-127.0.0.1}:7080/"
+curl "http://${TAILSCALE_HOST:-127.0.0.1}:7080/api/snapshot"
+```
+
+Use `--web-addr ${TAILSCALE_IP:-0.0.0.0}:7081` to move the web port, or
+`--disable-web` to run only the gRPC controller.
 
 Windows PowerShell:
 
@@ -375,6 +386,8 @@ This is an external-network smoke test, not a deterministic CI test.
 | `TAILSCALE_IP` | controller, agent | Bind address host |
 | `BCP_CONTROLLER_ADDR` | controller | Explicit global controller bind address |
 | `BCP_CONTROLLER_DB` | controller | SQLite path for global fleet state |
+| `BCP_CONTROLLER_WEB_ADDR` | controller | Explicit native web UI bind address |
+| `BCP_CONTROLLER_DISABLE_WEB` | controller | Disable the native web UI when set to true |
 | `BCP_AGENT_ADDR` | agent | Explicit machine controller bind address |
 | `BCP_AGENT_DB` | agent | SQLite path for local profile state |
 | `BCP_AGENT_CONFIG` | agent | TOML profile discovery config path |

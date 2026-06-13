@@ -11,6 +11,8 @@ use prost::Message;
 use rusqlite::{Connection, params};
 use tonic::{Request, Response, Status};
 
+pub mod web;
+
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 300;
 const DEFAULT_HEARTBEAT_AFTER_SECONDS: i32 = 10;
 const METRIC_BUCKET_MS: i64 = 60_000;
@@ -99,6 +101,78 @@ impl ControllerService {
             network,
             store: Some(Arc::new(Mutex::new(conn))),
         })
+    }
+
+    pub fn web_snapshot(&self) -> web::ControllerWebSnapshot {
+        let now = self.clock.now_unix_ms();
+        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut next_state = state.clone();
+        let expired = Self::mark_expired_leases(&mut next_state, now);
+        if expired && self.persist_state(&next_state).is_ok() {
+            *state = next_state.clone();
+        }
+        drop(state);
+        let state = next_state;
+
+        let mut machines: Vec<_> = state.machines.values().cloned().map(machine_view).collect();
+        machines.sort_by(|left, right| left.machine_id.cmp(&right.machine_id));
+
+        let mut profiles: Vec<_> = state.profiles.values().cloned().map(profile_view).collect();
+        profiles.sort_by(|left, right| {
+            left.machine_id
+                .cmp(&right.machine_id)
+                .then(left.profile_id.cmp(&right.profile_id))
+        });
+
+        let mut accounts: Vec<_> = state
+            .account_bindings
+            .values()
+            .filter_map(|binding| Self::live_binding(&state, binding))
+            .map(account_binding_view)
+            .collect();
+        accounts.sort_by(|left, right| {
+            left.platform
+                .cmp(&right.platform)
+                .then(left.account_id.cmp(&right.account_id))
+        });
+
+        let mut leases: Vec<_> = state.leases.values().cloned().map(lease_view).collect();
+        leases.sort_by_key(|lease| lease.expires_at_unix_ms);
+
+        let mut metrics: Vec<_> = state.metrics.values().cloned().map(metric_view).collect();
+        metrics.sort_by_key(|metric| std::cmp::Reverse(metric.bucket_start_unix_ms));
+
+        let mut events: Vec<_> = state.events.iter().cloned().map(event_view).collect();
+        events.sort_by_key(|event| std::cmp::Reverse(event.observed_at_unix_ms));
+        events.truncate(DEFAULT_EVENT_LIMIT);
+
+        let mut artifacts: Vec<_> = state
+            .artifacts
+            .values()
+            .cloned()
+            .map(artifact_view)
+            .collect();
+        artifacts.sort_by_key(|artifact| artifact.expires_at_unix_ms);
+
+        web::ControllerWebSnapshot {
+            generated_at_unix_ms: now,
+            counts: web::FleetCounts {
+                machines: machines.len(),
+                profiles: profiles.len(),
+                accounts: accounts.len(),
+                active_leases: leases.len(),
+                metrics: metrics.len(),
+                events: state.events.len(),
+                artifacts: artifacts.len(),
+            },
+            machines,
+            profiles,
+            accounts,
+            leases,
+            metrics,
+            events,
+            artifacts,
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -1104,6 +1178,180 @@ fn metric_point_id(point: &MetricPoint) -> String {
     .join("\u{1f}")
 }
 
+fn machine_view(machine: Machine) -> web::MachineView {
+    web::MachineView {
+        machine_id: machine.machine_id,
+        hostname: machine.hostname,
+        status: machine_status_label(machine.status),
+        agent_grpc_addr: machine.agent_grpc_addr,
+        tailscale_host: machine.tailscale_host,
+        last_heartbeat_unix_ms: machine.last_heartbeat_unix_ms,
+        labels: key_values(machine.labels),
+    }
+}
+
+fn profile_view(profile: BrowserProfile) -> web::ProfileView {
+    web::ProfileView {
+        profile_id: profile.profile_id,
+        machine_id: profile.machine_id,
+        display_name: profile.display_name,
+        status: profile_status_label(profile.status),
+        cdp_url: profile.cdp_url,
+        cdp_port: profile.cdp_port,
+        last_seen_unix_ms: profile.last_seen_unix_ms,
+        accounts: profile.accounts.into_iter().map(account_view).collect(),
+        labels: key_values(profile.labels),
+    }
+}
+
+fn account_view(account: Account) -> web::AccountView {
+    web::AccountView {
+        account_id: account.account_id,
+        platform: platform_label(account.platform),
+        handle: account.handle,
+        health: account.health,
+        capabilities: account.capabilities,
+    }
+}
+
+fn account_binding_view(binding: BrowserAccountBinding) -> web::AccountBindingView {
+    web::AccountBindingView {
+        binding_id: binding.binding_id,
+        profile_id: binding.profile_id,
+        machine_id: binding.machine_id,
+        platform: platform_label(binding.platform),
+        account_id: binding.account_id,
+        handle: binding.handle,
+        account_health: binding.account_health,
+        profile_status: profile_status_label(binding.profile_status),
+        agent_grpc_addr: binding.agent_grpc_addr,
+        cdp_url: binding.cdp_url,
+        last_seen_unix_ms: binding.last_seen_unix_ms,
+    }
+}
+
+fn lease_view(lease: BrowserLease) -> web::LeaseView {
+    web::LeaseView {
+        lease_id: lease.lease_id,
+        profile_id: lease.profile_id,
+        machine_id: lease.machine_id,
+        client_id: lease.client_id,
+        purpose: lease.purpose,
+        expires_at_unix_ms: lease.expires_at_unix_ms,
+    }
+}
+
+fn metric_view(metric: MetricPoint) -> web::MetricView {
+    web::MetricView {
+        name: metric.name,
+        value: metric.value,
+        bucket_start_unix_ms: metric.bucket_start_unix_ms,
+        machine_id: metric.machine_id,
+        profile_id: metric.profile_id,
+        platform: platform_label(metric.platform),
+        domain: metric.domain,
+        action: metric.action,
+        status_class: metric.status_class,
+        error_class: metric.error_class,
+    }
+}
+
+fn event_view(event: ControlPlaneEvent) -> web::EventView {
+    web::EventView {
+        event_type: event.event_type,
+        severity: event_severity_label(event.severity),
+        observed_at_unix_ms: event.observed_at_unix_ms,
+        machine_id: event.machine_id,
+        profile_id: event.profile_id,
+        message: event.message,
+        attributes: key_values(event.attributes),
+    }
+}
+
+fn artifact_view(artifact: Artifact) -> web::ArtifactView {
+    web::ArtifactView {
+        artifact_id: artifact.artifact_id,
+        machine_id: artifact.machine_id,
+        profile_id: artifact.profile_id,
+        lease_id: artifact.lease_id,
+        original_filename: artifact.original_filename,
+        content_type: artifact.content_type,
+        purpose: artifact.purpose,
+        status: artifact_status_label(artifact.status),
+        size_bytes: artifact.size_bytes,
+        expires_at_unix_ms: artifact.expires_at_unix_ms,
+    }
+}
+
+fn key_values(values: HashMap<String, String>) -> Vec<web::KeyValueView> {
+    let mut values: Vec<_> = values
+        .into_iter()
+        .map(|(key, value)| web::KeyValueView { key, value })
+        .collect();
+    values.sort_by(|left, right| left.key.cmp(&right.key));
+    values
+}
+
+fn machine_status_label(status: i32) -> String {
+    match MachineStatus::try_from(status).unwrap_or(MachineStatus::Unspecified) {
+        MachineStatus::Online => "online",
+        MachineStatus::Degraded => "degraded",
+        MachineStatus::Offline => "offline",
+        MachineStatus::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
+fn profile_status_label(status: i32) -> String {
+    match ProfileStatus::try_from(status).unwrap_or(ProfileStatus::Unspecified) {
+        ProfileStatus::Available => "available",
+        ProfileStatus::Leased => "leased",
+        ProfileStatus::Launching => "launching",
+        ProfileStatus::Broken => "broken",
+        ProfileStatus::Quarantined => "quarantined",
+        ProfileStatus::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
+fn platform_label(platform: i32) -> String {
+    match AccountPlatform::try_from(platform).unwrap_or(AccountPlatform::Unspecified) {
+        AccountPlatform::Youtube => "youtube",
+        AccountPlatform::X => "x",
+        AccountPlatform::Douyin => "douyin",
+        AccountPlatform::Tiktok => "tiktok",
+        AccountPlatform::Reddit => "reddit",
+        AccountPlatform::Zhihu => "zhihu",
+        AccountPlatform::Weibo => "weibo",
+        AccountPlatform::Wsj => "wsj",
+        AccountPlatform::HackerNews => "hacker-news",
+        AccountPlatform::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
+fn event_severity_label(severity: i32) -> String {
+    match EventSeverity::try_from(severity).unwrap_or(EventSeverity::Unspecified) {
+        EventSeverity::Info => "info",
+        EventSeverity::Warn => "warn",
+        EventSeverity::Error => "error",
+        EventSeverity::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
+fn artifact_status_label(status: i32) -> String {
+    match ArtifactStatus::try_from(status).unwrap_or(ArtifactStatus::Unspecified) {
+        ArtifactStatus::Uploading => "uploading",
+        ArtifactStatus::Available => "available",
+        ArtifactStatus::Expired => "expired",
+        ArtifactStatus::Deleted => "deleted",
+        ArtifactStatus::Failed => "failed",
+        ArtifactStatus::Unspecified => "unspecified",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1237,6 +1485,45 @@ mod tests {
         assert_eq!(binding.profile_status, ProfileStatus::Available as i32);
         assert_eq!(binding.agent_grpc_addr, "http://machine-a.tail.test:7100");
         assert_eq!(binding.last_seen_unix_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn web_snapshot_summarizes_fleet_without_fencing_tokens() {
+        // Arrange
+        let service = test_service();
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(machine()),
+                profiles: vec![profile()],
+            }))
+            .await
+            .unwrap();
+        let lease = service
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "client-1".to_string(),
+                purpose: "dashboard".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "yt-1".to_string(),
+                label_selector: HashMap::new(),
+                ttl_seconds: 60,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .lease
+            .unwrap();
+
+        // Act
+        let snapshot = service.web_snapshot();
+        let raw = serde_json::to_string(&snapshot).unwrap();
+
+        // Assert
+        assert_eq!(snapshot.counts.machines, 1);
+        assert_eq!(snapshot.counts.profiles, 1);
+        assert_eq!(snapshot.counts.accounts, 1);
+        assert_eq!(snapshot.counts.active_leases, 1);
+        assert_eq!(snapshot.leases[0].lease_id, lease.lease_id);
+        assert!(!raw.contains(&lease.fencing_token));
     }
 
     #[tokio::test]

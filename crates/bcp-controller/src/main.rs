@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bcp_controller::ControllerService;
+use bcp_controller::{ControllerService, web};
 use bcp_core::id::UuidIdGenerator;
 use bcp_core::network::StaticNetworkDirectory;
 use bcp_core::time::SystemClock;
@@ -19,6 +19,14 @@ struct Args {
     /// SQLite database path for controller state.
     #[arg(long, env = "BCP_CONTROLLER_DB")]
     db_path: Option<PathBuf>,
+
+    /// HTTP web UI address. Defaults to TAILSCALE_IP:7080, then 0.0.0.0:7080.
+    #[arg(long, env = "BCP_CONTROLLER_WEB_ADDR")]
+    web_addr: Option<SocketAddr>,
+
+    /// Disable the built-in HTTP web UI.
+    #[arg(long, env = "BCP_CONTROLLER_DISABLE_WEB", default_value_t = false)]
+    disable_web: bool,
 }
 
 #[tokio::main]
@@ -41,10 +49,19 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(StaticNetworkDirectory::default()),
     )?;
 
-    tonic::transport::Server::builder()
-        .add_service(GlobalControllerServer::new(service))
-        .serve(addr)
-        .await?;
+    let grpc = tonic::transport::Server::builder()
+        .add_service(GlobalControllerServer::new(service.clone()))
+        .serve(addr);
+
+    if args.disable_web {
+        grpc.await?;
+    } else {
+        let web_addr = args.web_addr.unwrap_or_else(default_web_addr);
+        tokio::select! {
+            result = grpc => result?,
+            result = web::serve(web_addr, service) => result?,
+        }
+    }
 
     Ok(())
 }
@@ -58,4 +75,11 @@ fn default_addr() -> SocketAddr {
 
 fn default_db_path() -> PathBuf {
     PathBuf::from(".bcp").join("controller.sqlite")
+}
+
+fn default_web_addr() -> SocketAddr {
+    let host = std::env::var("TAILSCALE_IP").unwrap_or_else(|_| "0.0.0.0".to_string());
+    format!("{host}:7080")
+        .parse()
+        .expect("default controller web address should parse")
 }
