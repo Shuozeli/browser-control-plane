@@ -1,0 +1,52 @@
+name: Daily E2E
+
+on:
+  schedule:
+    - cron: "17 12 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  deterministic-docker-e2e:
+    name: Docker E2E (Deterministic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run recording topology
+        run: docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit --exit-code-from e2e-client
+      - name: Run SQLite persistence topology
+        run: docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
+      - name: Run fake failure topology
+        run: docker compose -f tests/e2e/docker-compose.failures.yml up --build --abort-on-container-exit --exit-code-from fake-failures-e2e
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose -f tests/e2e/docker-compose.yml logs
+          docker compose -f tests/e2e/docker-compose.sqlite.yml logs
+          docker compose -f tests/e2e/docker-compose.failures.yml logs
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f tests/e2e/docker-compose.yml down
+          docker compose -f tests/e2e/docker-compose.sqlite.yml down
+          docker compose -f tests/e2e/docker-compose.failures.yml down
+
+  live-web-hn-e2e:
+    name: Docker E2E (Hacker News Live Web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Hacker News real-web topology
+        run: docker compose -f tests/e2e/docker-compose.hn.yml up --build --abort-on-container-exit --exit-code-from e2e-client
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -f tests/e2e/docker-compose.hn.yml logs
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.hn.yml down
