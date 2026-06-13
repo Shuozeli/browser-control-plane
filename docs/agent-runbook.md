@@ -34,6 +34,7 @@ The most common user deployment is one computer:
 ```text
 same host:
   bcp-controller :7000
+  bcp-controller :7080 native web UI
   bcp-agent      :7100
   Chrome/CDP     local implementation detail
 ```
@@ -43,6 +44,7 @@ The multi-computer deployment adds one `bcp-agent` per browser host:
 ```text
 controller host:
   bcp-controller :7000
+  bcp-controller :7080 native web UI
 
 browser host A:
   bcp-agent :7100
@@ -72,6 +74,17 @@ happened. Do not immediately report a network bug. Check:
 Durable state is SQLite-backed. The global controller uses
 `BCP_CONTROLLER_DB` or `.bcp/controller.sqlite`; the machine controller uses
 `BCP_AGENT_DB` or `.bcp/agent.sqlite`.
+
+The global controller starts a read-only native web UI by default. Use it to
+inspect fleet state while debugging:
+
+```bash
+curl http://<controller-magicdns-name>:7080/healthz
+curl http://<controller-magicdns-name>:7080/api/snapshot
+```
+
+The snapshot must not include lease fencing tokens. Browser work still has to
+go through the gRPC lease flow and the machine controller.
 
 ## Fast Exploration Checklist
 
@@ -106,6 +119,7 @@ Docker can pull `chromedp/headless-shell`.
 ```bash
 cargo run --release -p bcp-client -- machines
 cargo run --release -p bcp-client -- lookup --platform youtube --account-id yt-main
+curl http://<controller-magicdns-name>:7080/api/snapshot
 ```
 
 Expected lookup behavior:

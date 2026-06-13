@@ -12,7 +12,7 @@
 
 ## Non-Goals
 
-- A web dashboard in the first phase.
+- A write-capable web dashboard in the first phase.
 - Browser stealth or anti-detection logic.
 - Direct client access to Chrome CDP ports.
 - Multi-tenant public internet exposure.
@@ -68,6 +68,20 @@ browser proxy.
 The global controller depends on a network directory abstraction to resolve a
 machine into an agent endpoint. Tests can inject a fake/static topology, while
 production can resolve Tailscale MagicDNS endpoints or service-discovery data.
+
+## Operator UI
+
+The first implementation includes a native read-only controller web UI. It is
+for fleet inspection only:
+
+- view machines, profiles, accounts, active leases, recent events, metrics, and
+  artifacts
+- fetch the same data as JSON from `/api/snapshot`
+- avoid exposing `fencing_token` or write operations
+
+Mutating actions such as lease release, profile quarantine, or browser restarts
+remain future work and need audit events and authentication before they are
+enabled from the UI.
 
 ## Lease Model
 

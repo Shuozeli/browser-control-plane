@@ -17,6 +17,22 @@ should help answer:
 - Which profiles are broken, quarantined, or need login repair?
 - What route would a client receive for a given account/platform request?
 
+## Implementation Status
+
+The first native controller web UI is implemented in `bcp-controller`:
+
+- `GET /`: self-contained read-only HTML dashboard
+- `GET /api/snapshot`: fleet snapshot JSON
+- `GET /healthz`: HTTP liveness probe
+- default bind: `$TAILSCALE_IP:7080`, or `0.0.0.0:7080` when `TAILSCALE_IP` is
+  not set
+- override: `--web-addr` or `BCP_CONTROLLER_WEB_ADDR`
+- disable: `--disable-web` or `BCP_CONTROLLER_DISABLE_WEB=true`
+
+The implementation intentionally omits fencing tokens and write operations.
+Route dry-runs, mutation actions, authentication, and public URL advertisement
+remain future work.
+
 ## Non-Goals
 
 - Do not build browser automation workflows in the UI first.
@@ -345,15 +361,16 @@ it survives Tailscale IP rotation and works across tailnet devices.
 Suggested environment variables:
 
 ```text
-BCP_HTTP_ADDR          optional explicit bind address
-BCP_PUBLIC_BASE_URL    optional explicit operator URL
+BCP_CONTROLLER_WEB_ADDR     optional explicit bind address
+BCP_CONTROLLER_DISABLE_WEB  disable the native web UI
+BCP_PUBLIC_BASE_URL         optional explicit operator URL, future work
 TAILSCALE_IP           bind host, usually exported by operator shell/service
 TAILSCALE_HOST         canonical MagicDNS host with suffix
 ```
 
 Resolution order for bind address:
 
-1. `BCP_HTTP_ADDR`
+1. `BCP_CONTROLLER_WEB_ADDR`
 2. `$TAILSCALE_IP:7080`
 3. `0.0.0.0:7080`
 

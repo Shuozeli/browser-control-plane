@@ -54,6 +54,19 @@ available=true
 agent_grpc_addr=http://<machine-magicdns-name>:7100
 ```
 
+Verify the native controller web UI:
+
+```bash
+curl http://<controller-magicdns-name>:7080/healthz
+curl http://<controller-magicdns-name>:7080/api/snapshot
+```
+
+The HTML dashboard is served from:
+
+```text
+http://<controller-magicdns-name>:7080/
+```
+
 ## Codelab 2: Recording Docker E2E
 
 This test uses fake/recording pwright gateways and validates:

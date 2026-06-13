@@ -21,6 +21,8 @@ Browser Control Plane has two control layers:
 The global controller is the fleet registry and router. It tracks machines,
 profiles, accounts, heartbeats, profile status, and leases. It decides which
 machine should handle a request, but it does not directly talk to Chrome.
+It also exposes a native read-only HTTP dashboard for operators and agents to
+inspect the fleet snapshot without speaking gRPC.
 
 The machine controller runs once per machine. It is the local authority for
 Chrome process lifecycle, profile paths, CDP ports, local health checks, and
@@ -52,6 +54,20 @@ Client ───────► Global Controller
 
 The global controller is not in the browser data path after route acquisition.
 That keeps high-volume browser interactions local to the owning machine.
+
+## Native Controller Web UI
+
+`bcp-controller` serves a native read-only HTTP UI on `$TAILSCALE_IP:7080` by
+default. The UI is intentionally an operator surface, not a browser data path.
+It reads the same controller state as the gRPC service and exposes:
+
+- `/`: a self-contained fleet dashboard
+- `/api/snapshot`: machines, profiles, account bindings, active leases, recent
+  events, metric buckets, and artifact metadata
+- `/healthz`: HTTP liveness probe
+
+The snapshot omits lease fencing tokens. Browser execution still requires the
+gRPC lease flow and machine-controller lease installation.
 
 ## Resource Model
 

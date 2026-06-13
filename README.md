@@ -36,6 +36,8 @@ controller is the local proxy and lifecycle manager for browsers on one host.
 Machine controllers also own local short-lived artifacts such as upload videos:
 clients stream files to the routed machine controller with a required TTL, and
 metadata can be reported back to the global controller for fleet visibility.
+The global controller also serves a read-only native web UI for operator
+inspection at `/` and a JSON snapshot at `/api/snapshot`.
 
 User flow:
 
@@ -70,6 +72,10 @@ each machine controller stores local profile state in `BCP_AGENT_DB` or
 `.bcp/agent.sqlite`. Machine artifact storage is controlled by
 `BCP_ARTIFACT_DIR`, `BCP_ARTIFACT_MAX_TTL_SECONDS`, and
 `BCP_ARTIFACT_CLEANUP_SECONDS`.
+
+`bcp-controller` starts the native web UI on `$TAILSCALE_IP:7080` by default.
+Use `--web-addr` or `BCP_CONTROLLER_WEB_ADDR` to move it, and `--disable-web`
+or `BCP_CONTROLLER_DISABLE_WEB=true` to run only the gRPC controller.
 
 For deployment, start with the single-computer path in
 [Deployment](docs/deployment.md). `bcp-agent` auto-registers with the global

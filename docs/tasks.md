@@ -23,21 +23,21 @@
 
 - [x] Add SQLite controller storage.
 - [x] Implement machine registration.
-- [ ] Implement heartbeat ingestion.
-- [ ] Implement profile/account registry updates.
-- [ ] Implement profile selection.
-- [ ] Implement lease grant, renewal, expiration, and release.
-- [ ] Implement route lookup.
+- [x] Implement heartbeat ingestion.
+- [x] Implement profile/account registry updates.
+- [x] Implement profile selection.
+- [x] Implement lease grant, renewal, expiration, and release.
+- [x] Implement route lookup.
 - [x] Add agent auto-registration.
 - [ ] Add richer controller heartbeat reporting.
 
 ## Phase 3: Browser Proxy
 
 - [ ] Integrate local browser operations with `pwright-bridge`.
-- [ ] Implement snapshot proxy.
-- [ ] Implement action proxy.
-- [ ] Implement evaluate proxy.
-- [ ] Implement script proxy.
+- [x] Implement snapshot proxy.
+- [x] Implement action proxy.
+- [x] Implement evaluate proxy.
+- [x] Implement script proxy.
 - [ ] Add structured audit events for all browser operations.
 
 ## Phase 4: Client
@@ -59,11 +59,11 @@
 
 ## Phase 5.5: Observability
 
-- [ ] Add telemetry proto API.
-- [ ] Add in-memory metric aggregation buckets.
-- [ ] Add machine/browser/profile/account health samples.
-- [ ] Add domain-level web access aggregation.
-- [ ] Add recent structured control-plane events.
+- [x] Add telemetry proto API.
+- [x] Add in-memory metric aggregation buckets.
+- [x] Add machine/browser/profile/account health samples.
+- [x] Add domain-level web access aggregation.
+- [x] Add recent structured control-plane events.
 - [x] Add tests proving full URLs and page content are not retained by default.
 - [ ] Add OTLP exporter for controller and machine-controller metrics.
 - [ ] Add dashboard JSON/templates for OpenTelemetry-compatible tooling.
@@ -80,12 +80,12 @@
 
 ## Phase 6: HTML Console
 
-- [ ] Add read-only HTML console design review.
-- [ ] Add controller HTTP listener.
-- [ ] Bind HTTP listener to Tailscale IP by default.
+- [x] Add read-only HTML console design review.
+- [x] Add controller HTTP listener.
+- [x] Bind HTTP listener to Tailscale IP by default.
 - [ ] Advertise full Tailscale MagicDNS URL in logs and UI.
-- [ ] Serve static HTML and assets.
-- [ ] Add JSON view endpoints for machines, profiles, accounts, leases, and events.
+- [x] Serve static HTML and assets.
+- [x] Add JSON view endpoints for machines, profiles, accounts, leases, and events.
 - [ ] Add route dry-run view.
 - [ ] Add lease release/renew operations with audit events.
 - [ ] Add profile quarantine operations with audit events.

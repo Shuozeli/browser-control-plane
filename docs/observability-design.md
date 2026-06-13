@@ -206,11 +206,13 @@ Global controller should expose:
 Machine controller should aggregate locally before reporting. This reduces
 traffic and avoids shipping raw browsing details to the global controller.
 
-## OpenTelemetry Dashboard Strategy
+## Dashboard Strategy
 
-Browser Control Plane should not build its own dashboard UI for fleet health.
-The controller and machine controllers should emit OpenTelemetry-compatible
-signals and let existing observability tools provide dashboards.
+Browser Control Plane now includes a small native read-only controller web UI
+for fleet inspection and debugging. That UI is not a replacement for
+OpenTelemetry-compatible observability. The controller and machine controllers
+should still emit stable metrics/events so existing observability tools can
+provide long-retention dashboards, alerts, and cross-service correlation.
 
 Recommended dashboard surfaces:
 
@@ -237,6 +239,11 @@ bcp.web.bytes_received
 The in-memory `ReportTelemetry` API is the first implementation. A later
 exporter can translate the same metric/event model to OTLP without changing the
 fleet manager or pwright proxy logic.
+
+The native web UI should stay low-cardinality and privacy-preserving. It can
+show the current aggregate snapshot and recent events, but it should not retain
+or display raw full URLs, HTML, request bodies, response bodies, or lease
+fencing tokens.
 
 ## Local Aggregation
 
