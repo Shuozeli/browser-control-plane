@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
     match std::env::var("BCP_E2E_MODE").as_deref() {
         Ok("real-browser") => real_browser_main().await,
         Ok("real-web-wsj") => real_web_wsj_main().await,
+        Ok("real-web-hn") => real_web_hn_main().await,
         Ok("fake-failures") => fake_failures_main().await,
         Ok("sqlite-persistence") => sqlite_persistence_main().await,
         _ => recording_main().await,
@@ -650,6 +651,62 @@ async fn real_web_wsj_main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn real_web_hn_main() -> anyhow::Result<()> {
+    let controller =
+        std::env::var("BCP_CONTROLLER").unwrap_or_else(|_| "http://controller:7000".to_string());
+    let mut global = connect_global(&controller).await?;
+
+    for machine in ["a", "b", "c"] {
+        let machine_id = format!("machine-{machine}");
+        let agent_addr = format!("http://agent-{machine}:7100");
+        let profiles = (1..=3)
+            .map(|index| {
+                real_profile(
+                    &format!("hn-{machine}-{index}"),
+                    &machine_id,
+                    AccountPlatform::HackerNews,
+                    &format!("hn-{machine}-{index}"),
+                    &format!("http://172.32.{}.1{index}:9222", machine_octet(machine)),
+                )
+            })
+            .collect();
+        register_machine_with_profiles(&mut global, &machine_id, &agent_addr, profiles).await?;
+    }
+
+    let mut all_headlines = Vec::new();
+    for machine in ["a", "b", "c"] {
+        for index in 1..=3 {
+            let account_id = format!("hn-{machine}-{index}");
+            let headlines = exercise_hn_profile(&mut global, &account_id).await?;
+            println!(
+                "hn headlines via {account_id}: {}",
+                headlines
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            all_headlines.extend(headlines);
+        }
+    }
+
+    all_headlines.sort();
+    all_headlines.dedup();
+    if all_headlines.len() < 10 {
+        bail!(
+            "expected at least ten unique Hacker News headline texts, got {}",
+            all_headlines.len()
+        );
+    }
+
+    println!(
+        "docker hn e2e passed: collected {} unique headline texts across 9 browsers",
+        all_headlines.len()
+    );
+    Ok(())
+}
+
 async fn exercise_wsj_profile(
     global: &mut GlobalControllerClient<tonic::transport::Channel>,
     account_id: &str,
@@ -726,6 +783,75 @@ async fn exercise_wsj_profile(
     if headlines.len() < 3 {
         bail!(
             "expected at least three headline-like texts from {account_id}, got {}; href={href}; title={title}; headlines={:?}",
+            headlines.len(),
+            headlines
+        );
+    }
+    Ok(headlines)
+}
+
+async fn exercise_hn_profile(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    account_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "docker-hn-e2e".to_string(),
+            purpose: "collect-hn-headlines".to_string(),
+            platform: AccountPlatform::HackerNews as i32,
+            account_id: account_id.to_string(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 120,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("controller did not return route")?;
+    let lease = acquired.lease.context("controller did not return lease")?;
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .ensure_browser(EnsureBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+
+    let raw = agent
+        .evaluate(EvaluateRequest {
+            lease: Some(lease_context),
+            expression: hn_headline_expression(),
+        })
+        .await?
+        .into_inner()
+        .json_result;
+    let extraction: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse Hacker News extraction JSON from {account_id}: {raw}"))?;
+    let href = extraction
+        .get("href")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let title = extraction
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let headlines = extraction
+        .get("headlines")
+        .and_then(|value| value.as_array())
+        .context("Hacker News extraction did not include a headlines array")?
+        .iter()
+        .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    if headlines.len() < 10 {
+        bail!(
+            "expected at least ten Hacker News headlines from {account_id}, got {}; href={href}; title={title}; headlines={:?}",
             headlines.len(),
             headlines
         );
@@ -878,6 +1004,28 @@ fn wsj_headline_expression() -> String {
     if (headlines.length >= 30) break;
   }
   return JSON.stringify({ href, title, blocked, blockSignal, headlines });
+})()
+"#
+    .to_string()
+}
+
+fn hn_headline_expression() -> String {
+    r#"
+(() => {
+  const href = window.location.href;
+  const title = document.title || "";
+  const seen = new Set();
+  const headlines = [];
+  for (const el of document.querySelectorAll(".titleline > a, tr.athing .title a")) {
+    const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    if (text.length < 5 || text.length > 180) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    headlines.push(text);
+    if (headlines.length >= 30) break;
+  }
+  return JSON.stringify({ href, title, headlines });
 })()
 "#
     .to_string()

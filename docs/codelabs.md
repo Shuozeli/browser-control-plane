@@ -148,7 +148,34 @@ docker real-browser e2e passed: controller routed to real CDP browsers
 If this fails before building, check whether Cargo can fetch the `Shuozeli/pwright`
 git dependency used by the `bcp-agent/real-pwright` feature.
 
-## Codelab 6: WSJ Real-Web Docker E2E
+## Codelab 6: Hacker News Real-Web Docker E2E
+
+This manual smoke test runs a larger topology against a live public site:
+
+- one global controller
+- three machine controllers
+- three Chrome/CDP containers per machine
+- nine Hacker News browser profiles total
+- one E2E client that acquires each browser through the control plane and
+  extracts visible story titles from `https://news.ycombinator.com/`
+
+Run:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.hn.yml up --build --abort-on-container-exit --exit-code-from e2e-client
+docker compose -f tests/e2e/docker-compose.hn.yml down
+```
+
+Expected terminal line:
+
+```text
+docker hn e2e passed: collected <N> unique headline texts across 9 browsers
+```
+
+This is the preferred live-web smoke test because Hacker News is mostly static
+and does not require an account.
+
+## Codelab 7: WSJ Real-Web Docker E2E
 
 This manual smoke test runs a larger topology against the live internet:
 
@@ -176,7 +203,7 @@ This test is intentionally not part of default CI. WSJ can change markup, block
 automation, require regional consent flows, or be unavailable from the runner's
 network.
 
-## Codelab 7: Lookup Versus Acquire
+## Codelab 8: Lookup Versus Acquire
 
 Lookup answers where an account lives and whether it is available. It does not
 grant permission to operate the browser.
@@ -196,7 +223,7 @@ Important security invariant:
 - Lookup must not show `fencing_token`.
 - Browser work must go through the machine controller, not directly to CDP.
 
-## Codelab 8: Bug Report Drill
+## Codelab 9: Bug Report Drill
 
 When a codelab fails, create a bug report using the template in
 [Agent Runbook](agent-runbook.md#bug-report-format).

@@ -1,0 +1,181 @@
+x-bcp-build: &bcp-build
+  context: ../..
+  dockerfile: Dockerfile.e2e
+
+services:
+  controller:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-controller
+    command:
+      - --addr
+      - 0.0.0.0:7000
+    networks:
+      control-net:
+        aliases:
+          - controller
+
+  chrome-a1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.32.10.11
+  chrome-a2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.32.10.12
+  chrome-a3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-a-net:
+        ipv4_address: 172.32.10.13
+
+  chrome-b1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.32.20.11
+  chrome-b2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.32.20.12
+  chrome-b3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-b-net:
+        ipv4_address: 172.32.20.13
+
+  chrome-c1:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.32.30.11
+  chrome-c2:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.32.30.12
+  chrome-c3:
+    image: chromedp/headless-shell:latest
+    shm_size: "1gb"
+    networks:
+      machine-c-net:
+        ipv4_address: 172.32.30.13
+
+  agent-a:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-a
+      BCP_REAL_PROFILES: >-
+        hn-a-1|hn-a-1|hn|http://172.32.10.11:9222|https://news.ycombinator.com/;
+        hn-a-2|hn-a-2|hn|http://172.32.10.12:9222|https://news.ycombinator.com/;
+        hn-a-3|hn-a-3|hn|http://172.32.10.13:9222|https://news.ycombinator.com/
+    depends_on:
+      - chrome-a1
+      - chrome-a2
+      - chrome-a3
+    networks:
+      control-net:
+        aliases:
+          - agent-a
+      machine-a-net:
+
+  agent-b:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-b
+      BCP_REAL_PROFILES: >-
+        hn-b-1|hn-b-1|hn|http://172.32.20.11:9222|https://news.ycombinator.com/;
+        hn-b-2|hn-b-2|hn|http://172.32.20.12:9222|https://news.ycombinator.com/;
+        hn-b-3|hn-b-3|hn|http://172.32.20.13:9222|https://news.ycombinator.com/
+    depends_on:
+      - chrome-b1
+      - chrome-b2
+      - chrome-b3
+    networks:
+      control-net:
+        aliases:
+          - agent-b
+      machine-b-net:
+
+  agent-c:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-agent
+    command:
+      - --addr
+      - 0.0.0.0:7100
+    environment:
+      BCP_MACHINE_ID: machine-c
+      BCP_REAL_PROFILES: >-
+        hn-c-1|hn-c-1|hn|http://172.32.30.11:9222|https://news.ycombinator.com/;
+        hn-c-2|hn-c-2|hn|http://172.32.30.12:9222|https://news.ycombinator.com/;
+        hn-c-3|hn-c-3|hn|http://172.32.30.13:9222|https://news.ycombinator.com/
+    depends_on:
+      - chrome-c1
+      - chrome-c2
+      - chrome-c3
+    networks:
+      control-net:
+        aliases:
+          - agent-c
+      machine-c-net:
+
+  e2e-client:
+    build: *bcp-build
+    image: browser-control-plane-real:local
+    entrypoint:
+      - /usr/local/bin/bcp-e2e
+    environment:
+      BCP_CONTROLLER: http://controller:7000
+      BCP_E2E_MODE: real-web-hn
+    depends_on:
+      - controller
+      - agent-a
+      - agent-b
+      - agent-c
+    networks:
+      control-net:
+
+networks:
+  control-net:
+    name: browser-control-plane-hn-control
+  machine-a-net:
+    name: browser-control-plane-hn-machine-a
+    ipam:
+      config:
+        - subnet: 172.32.10.0/24
+  machine-b-net:
+    name: browser-control-plane-hn-machine-b
+    ipam:
+      config:
+        - subnet: 172.32.20.0/24
+  machine-c-net:
+    name: browser-control-plane-hn-machine-c
+    ipam:
+      config:
+        - subnet: 172.32.30.0/24

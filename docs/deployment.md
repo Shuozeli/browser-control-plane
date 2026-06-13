@@ -117,7 +117,7 @@ profile_id|account_id|platform|cdp_url|initial_url;profile_id2|account_id2|platf
 ```
 
 Supported platform names: `youtube`, `x`, `douyin`, `tiktok`, `reddit`,
-`zhihu`, `weibo`, `wsj`.
+`zhihu`, `weibo`, `wsj`, `hn`, `hacker-news`, `hackernews`.
 
 For persistent deployments, prefer a TOML config file over env profile strings:
 
@@ -346,6 +346,17 @@ docker compose -f tests/e2e/docker-compose.real-browser.yml down
 
 The real-browser image enables the `bcp-agent/real-pwright` Cargo feature and
 fetches `pwright-bridge` from the `Shuozeli/pwright` git dependency.
+
+Manual real-web Hacker News topology with three machine controllers and nine
+Chrome instances:
+
+```bash
+COMPOSE_PROGRESS=plain docker compose -f tests/e2e/docker-compose.hn.yml up --build --abort-on-container-exit --exit-code-from e2e-client
+docker compose -f tests/e2e/docker-compose.hn.yml down
+```
+
+This is the recommended live-web smoke test because Hacker News is mostly
+static and does not require an account.
 
 Manual real-web WSJ topology with three machine controllers and nine Chrome
 instances:

@@ -57,6 +57,18 @@ Fake failure topology:
 - Restart the global controller with empty state and verify the still-running
   agent re-registers its machine/profile/account mapping.
 
+Hacker News real-web topology:
+
+- Start one global controller.
+- Start three machine-controller containers.
+- Start three real Chrome/CDP containers per machine, nine browsers total.
+- Register Hacker News browser profiles in the global controller.
+- Acquire each profile through the controller and route browser work through the
+  matching machine controller.
+- Navigate to `https://news.ycombinator.com/` and extract visible story titles.
+- This is the preferred manual external-network smoke test because the target
+  page is mostly static and does not require an account.
+
 WSJ real-web topology:
 
 - Start one global controller.
@@ -76,5 +88,6 @@ WSJ real-web topology:
 docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit
 docker compose -f tests/e2e/docker-compose.sqlite.yml up --build --abort-on-container-exit --exit-code-from sqlite-e2e
 docker compose -f tests/e2e/docker-compose.failures.yml up --build --abort-on-container-exit --exit-code-from fake-failures-e2e
+docker compose -f tests/e2e/docker-compose.hn.yml up --build --abort-on-container-exit --exit-code-from e2e-client
 docker compose -f tests/e2e/docker-compose.wsj.yml up --build --abort-on-container-exit --exit-code-from e2e-client
 ```

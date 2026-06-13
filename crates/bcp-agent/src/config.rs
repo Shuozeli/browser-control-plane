@@ -334,6 +334,7 @@ fn parse_platform(value: &str) -> Option<AccountPlatform> {
         "zhihu" => Some(AccountPlatform::Zhihu),
         "weibo" => Some(AccountPlatform::Weibo),
         "wsj" => Some(AccountPlatform::Wsj),
+        "hn" | "hacker-news" | "hackernews" => Some(AccountPlatform::HackerNews),
         _ => None,
     }
 }

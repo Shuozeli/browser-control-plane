@@ -101,6 +101,7 @@ fn parse_platform(value: &str) -> anyhow::Result<i32> {
         "zhihu" => AccountPlatform::Zhihu,
         "weibo" => AccountPlatform::Weibo,
         "wsj" => AccountPlatform::Wsj,
+        "hn" | "hacker-news" | "hackernews" => AccountPlatform::HackerNews,
         _ => anyhow::bail!("unsupported platform: {value}"),
     };
     Ok(platform as i32)
