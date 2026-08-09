@@ -1,0 +1,15 @@
+# NoCloud network-config (cloud-init v2). One per clone: set a unique static IP
+# on the VirtualBox NAT network so the fleet has deterministic addresses.
+# Replace <NODE_IP> (e.g. 10.0.9.11 for the controller, .12/.13/.14 for agents).
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    addresses:
+      - <NODE_IP>/24
+    routes:
+      - to: default
+        via: 10.0.9.1
+    nameservers:
+      addresses: [8.8.8.8, 1.1.1.1]

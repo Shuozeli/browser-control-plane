@@ -17,7 +17,11 @@
 - [x] Implement CDP port allocation.
 - [x] Implement config-driven browser process launch and stop.
 - [x] Implement browser health check and CDP readiness probe.
-- [ ] Add lease cache and local fencing validation.
+- [~] Add lease cache and local fencing validation. Installing a lease now
+      enforces one active lease per profile and revokes the prior one, so a
+      released/superseded lease can no longer pass `validate_lease`. Residual:
+      a released lease with no successor is not yet invalidated (needs the
+      controller to push an uninstall on release/expiry).
 
 ## Phase 2: Global Controller
 
@@ -50,12 +54,16 @@
 
 ## Phase 5: Reliability
 
-- [ ] Add stale machine detection.
+- [ ] Add stale machine detection. (Gap confirmed by the `failover` scenario:
+      a downed machine stays `online` until it is used.)
 - [ ] Add stale lease cleanup.
 - [ ] Add profile quarantine.
 - [ ] Add retry policy for controller-to-agent sync.
 - [ ] Add integration tests with fake machine controllers.
 - [x] Turn Docker multi-network topology skeleton into a runnable e2e suite.
+- [x] Add a real VirtualBox VM fleet test (`tests/vm-fleet`) plus `bcp-e2e`
+      `vm-fleet` and `scenarios` (exclusivity / fencing / failover /
+      persistence) modes driven by `BCP_FLEET`.
 
 ## Phase 5.5: Observability
 

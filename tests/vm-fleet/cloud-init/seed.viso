@@ -1,0 +1,5 @@
+--iprt-iso-maker-file-marker-bourne-sh <RANDOM_UUID>
+--volume-id=CIDATA
+/user-data=<HOST_PATH>/user-data
+/meta-data=<HOST_PATH>/meta-data
+/network-config=<HOST_PATH>/network-config

@@ -1,0 +1,19 @@
+# Per-agent machine-controller config (one per agent VM).
+# gateway = "real-pwright" makes the agent drive a real Chrome over CDP.
+# The driver (bcp-e2e) registers machines with the controller, so the agent
+# does NOT set BCP_CONTROLLER. Replace <NODE> / <PLATFORM> / <ACCOUNT>.
+machine_id = "<NODE>"
+gateway = "real-pwright"
+
+[[profiles]]
+profile_id = "<NODE>-profile"
+account_id = "<ACCOUNT>"
+platform = "<PLATFORM>"
+profile_path = "/home/cyuan/profiles/<NODE>"
+display_name = "<NODE>"
+cdp_url = "http://127.0.0.1:9222"
+cdp_port = 9222
+initial_url = "about:blank"
+handle = "@<ACCOUNT>"
+health = "logged_in"
+capabilities = ["snapshot", "click", "eval"]

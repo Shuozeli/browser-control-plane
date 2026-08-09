@@ -95,16 +95,21 @@ impl AgentService {
     }
 
     pub fn install_lease(&self, lease_id: &str, profile_id: &str, fencing_token: &str) {
-        self.leases
-            .write()
-            .expect("agent lease lock poisoned")
-            .insert(
-                lease_id.to_string(),
-                LocalLease {
-                    profile_id: profile_id.to_string(),
-                    fencing_token: fencing_token.to_string(),
-                },
-            );
+        let mut leases = self.leases.write().expect("agent lease lock poisoned");
+        // A profile can be leased to at most one client at a time. Installing a
+        // new lease for a profile atomically revokes any previously installed
+        // lease for the same profile, so a client whose lease was released or
+        // expired (and the profile re-leased) can no longer pass `validate_lease`.
+        leases.retain(|held_lease_id, lease| {
+            lease.profile_id != profile_id || held_lease_id == lease_id
+        });
+        leases.insert(
+            lease_id.to_string(),
+            LocalLease {
+                profile_id: profile_id.to_string(),
+                fencing_token: fencing_token.to_string(),
+            },
+        );
     }
 
     #[allow(clippy::result_large_err)]
@@ -539,6 +544,55 @@ mod tests {
 
         // Assert
         assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn installing_new_lease_revokes_prior_lease_for_same_profile() {
+        // Arrange
+        let gateway = Arc::new(RecordingPwrightGateway::new([RecordingProfileState {
+            profile: profile(),
+            healthy: true,
+            health_message: "ok".to_string(),
+            snapshot: vec![],
+            eval_json: "{}".to_string(),
+        }]));
+        let service = AgentService::new(gateway);
+        let old_lease = LeaseContext {
+            lease_id: "lease-old".to_string(),
+            profile_id: "youtube-main".to_string(),
+            fencing_token: "fence-old".to_string(),
+        };
+        let new_lease = LeaseContext {
+            lease_id: "lease-new".to_string(),
+            profile_id: "youtube-main".to_string(),
+            fencing_token: "fence-new".to_string(),
+        };
+        service.install_lease(
+            &old_lease.lease_id,
+            &old_lease.profile_id,
+            &old_lease.fencing_token,
+        );
+
+        // Act
+        service.install_lease(
+            &new_lease.lease_id,
+            &new_lease.profile_id,
+            &new_lease.fencing_token,
+        );
+
+        // Assert
+        let revoked = service
+            .get_snapshot(Request::new(GetSnapshotRequest {
+                lease: Some(old_lease),
+            }))
+            .await;
+        assert_eq!(revoked.unwrap_err().code(), tonic::Code::PermissionDenied);
+        let active = service
+            .get_snapshot(Request::new(GetSnapshotRequest {
+                lease: Some(new_lease),
+            }))
+            .await;
+        assert!(active.is_ok());
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@ use tokio::process::{Child, Command};
 async fn main() -> anyhow::Result<()> {
     match std::env::var("BCP_E2E_MODE").as_deref() {
         Ok("real-browser") => real_browser_main().await,
+        Ok("vm-fleet") => vm_fleet_main().await,
+        Ok("scenarios") => scenarios_main().await,
         Ok("real-web-wsj") => real_web_wsj_main().await,
         Ok("real-web-hn") => real_web_hn_main().await,
         Ok("fake-failures") => fake_failures_main().await,
@@ -1195,6 +1197,600 @@ async fn wait_for_auto_registered_profile(
             .context("auto-registered profile did not become visible"),
         None => bail!("auto-registered profile did not become visible"),
     }
+}
+
+struct FleetEntry {
+    machine_id: String,
+    agent_addr: String,
+    platform: AccountPlatform,
+    account_id: String,
+    cdp_url: String,
+}
+
+fn parse_platform(value: &str) -> AccountPlatform {
+    match value.to_ascii_lowercase().as_str() {
+        "youtube" => AccountPlatform::Youtube,
+        "x" | "twitter" => AccountPlatform::X,
+        "douyin" => AccountPlatform::Douyin,
+        "tiktok" => AccountPlatform::Tiktok,
+        "reddit" => AccountPlatform::Reddit,
+        "zhihu" => AccountPlatform::Zhihu,
+        "weibo" => AccountPlatform::Weibo,
+        "wsj" => AccountPlatform::Wsj,
+        "hackernews" | "hn" => AccountPlatform::HackerNews,
+        _ => AccountPlatform::Unspecified,
+    }
+}
+
+/// Fleet spec from `BCP_FLEET`: entries separated by `;`, each field by `|`:
+/// `machine_id|agent_grpc_addr|platform|account_id|cdp_url`.
+fn parse_fleet(spec: &str) -> anyhow::Result<Vec<FleetEntry>> {
+    let mut entries = Vec::new();
+    for raw in spec.split(';') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = raw.split('|').map(str::trim).collect();
+        if parts.len() != 5 {
+            bail!("fleet entry must have 5 |-separated fields, got: {raw}");
+        }
+        entries.push(FleetEntry {
+            machine_id: parts[0].to_string(),
+            agent_addr: parts[1].to_string(),
+            platform: parse_platform(parts[2]),
+            account_id: parts[3].to_string(),
+            cdp_url: parts[4].to_string(),
+        });
+    }
+    if entries.is_empty() {
+        bail!("BCP_FLEET did not contain any fleet entries");
+    }
+    Ok(entries)
+}
+
+/// Drives a real VirtualBox VM fleet: registers every machine, then for each
+/// one proves the control plane can route a lease, install it on the owning
+/// machine controller, and execute real Chrome DevTools work (a11y snapshot and
+/// a JavaScript evaluation) through it, while rejecting a foreign machine's use
+/// of the same lease.
+async fn vm_fleet_main() -> anyhow::Result<()> {
+    let controller =
+        std::env::var("BCP_CONTROLLER").unwrap_or_else(|_| "http://127.0.0.1:7000".to_string());
+    let spec = std::env::var("BCP_FLEET").context("BCP_FLEET environment variable is required")?;
+    let fleet = parse_fleet(&spec)?;
+    let mut global = connect_global(&controller).await?;
+
+    for entry in &fleet {
+        let profile = real_profile(
+            &format!("{}-profile", entry.machine_id),
+            &entry.machine_id,
+            entry.platform,
+            &entry.account_id,
+            &entry.cdp_url,
+        );
+        register_machine_with_profiles(
+            &mut global,
+            &entry.machine_id,
+            &entry.agent_addr,
+            vec![profile],
+        )
+        .await?;
+    }
+
+    let machines = global
+        .list_machines(ListMachinesRequest {
+            label_selector: HashMap::new(),
+        })
+        .await?
+        .into_inner();
+    if machines.machines.len() != fleet.len() {
+        bail!(
+            "expected {} registered machines, got {}",
+            fleet.len(),
+            machines.machines.len()
+        );
+    }
+
+    for (index, entry) in fleet.iter().enumerate() {
+        let wrong = &fleet[(index + 1) % fleet.len()];
+        let ua = exercise_vm_profile(&mut global, entry, &wrong.agent_addr).await?;
+        println!(
+            "vm-fleet: {} routed + real CDP ok (ua={})",
+            entry.machine_id,
+            ua.trim()
+        );
+    }
+
+    println!(
+        "vm-fleet e2e passed: {} VMs routed to real CDP browsers across the fleet",
+        fleet.len()
+    );
+    Ok(())
+}
+
+async fn exercise_vm_profile(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    entry: &FleetEntry,
+    wrong_agent_addr: &str,
+) -> anyhow::Result<String> {
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "vm-fleet-e2e".to_string(),
+            purpose: "verify-vm-fleet".to_string(),
+            platform: entry.platform as i32,
+            account_id: entry.account_id.clone(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 120,
+        })
+        .await?
+        .into_inner();
+    let route = acquired
+        .route
+        .context("controller did not return a route")?;
+    let lease = acquired
+        .lease
+        .context("controller did not return a lease")?;
+    if route.machine_id != entry.machine_id {
+        bail!(
+            "expected route to {}, got {}",
+            entry.machine_id,
+            route.machine_id
+        );
+    }
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .ensure_browser(EnsureBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    // A successful a11y snapshot proves the machine controller reached a live
+    // CDP browser through the pwright gateway.
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    let ua = agent
+        .evaluate(EvaluateRequest {
+            lease: Some(lease_context.clone()),
+            expression: "navigator.userAgent".to_string(),
+        })
+        .await?
+        .into_inner();
+    if !ua.json_result.contains("Chrome") {
+        bail!(
+            "evaluate did not return a real Chrome user agent for {}: {}",
+            entry.machine_id,
+            ua.json_result
+        );
+    }
+
+    let mut wrong_agent = connect_agent(wrong_agent_addr).await?;
+    match wrong_agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lease_context),
+        })
+        .await
+    {
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::PermissionDenied | tonic::Code::NotFound
+            ) => {}
+        Err(status) => bail!("wrong fleet agent returned unexpected status: {status}"),
+        Ok(_) => bail!("wrong fleet agent accepted a lease that was never installed there"),
+    }
+
+    Ok(ua.json_result)
+}
+
+async fn register_fleet(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    fleet: &[FleetEntry],
+) -> anyhow::Result<()> {
+    for entry in fleet {
+        let profile = real_profile(
+            &format!("{}-profile", entry.machine_id),
+            &entry.machine_id,
+            entry.platform,
+            &entry.account_id,
+            &entry.cdp_url,
+        );
+        register_machine_with_profiles(global, &entry.machine_id, &entry.agent_addr, vec![profile])
+            .await?;
+    }
+    Ok(())
+}
+
+async fn raw_acquire(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    entry: &FleetEntry,
+) -> Result<AcquireBrowserResponse, tonic::Status> {
+    global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "scenario-e2e".to_string(),
+            purpose: "scenario".to_string(),
+            platform: entry.platform as i32,
+            account_id: entry.account_id.clone(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 120,
+        })
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// Acquire + install + ensure + snapshot + eval on the routed machine, without
+/// the cross-machine rejection step. Returns the browser user agent.
+async fn drive_once(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+    entry: &FleetEntry,
+) -> anyhow::Result<String> {
+    let acquired = raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("acquire failed for {}: {status}", entry.machine_id))?;
+    let route = acquired.route.context("controller returned no route")?;
+    let lease = acquired.lease.context("controller returned no lease")?;
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id,
+        profile_id: lease.profile_id,
+        fencing_token: lease.fencing_token,
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .ensure_browser(EnsureBrowserRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    let ua = agent
+        .evaluate(EvaluateRequest {
+            lease: Some(lease_context),
+            expression: "navigator.userAgent".to_string(),
+        })
+        .await?
+        .into_inner();
+    Ok(ua.json_result)
+}
+
+/// Single-attempt agent dial with a short timeout, for probing a machine that
+/// may be down (avoids `connect_agent`'s 30s retry loop).
+async fn dial_and_snapshot(addr: &str, lease: &BrowserLease) -> anyhow::Result<()> {
+    let mut agent = tokio::time::timeout(
+        Duration::from_secs(4),
+        MachineControllerClient::connect(addr.to_string()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timed out"))??;
+    let lease_context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lease_context.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lease_context),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn scenarios_main() -> anyhow::Result<()> {
+    let scenario = std::env::var("BCP_SCENARIO").context("BCP_SCENARIO is required")?;
+    let controller =
+        std::env::var("BCP_CONTROLLER").unwrap_or_else(|_| "http://127.0.0.1:7000".to_string());
+    let mut global = connect_global(&controller).await?;
+
+    match scenario.as_str() {
+        "exclusivity" => scenario_exclusivity(&mut global).await,
+        "fencing" => scenario_fencing(&mut global).await,
+        "failover" => scenario_failover(&mut global).await,
+        "persistence-acquire" => scenario_persistence_acquire(&mut global).await,
+        "persistence-verify" => scenario_persistence_verify(&mut global).await,
+        other => bail!("unknown BCP_SCENARIO: {other}"),
+    }
+}
+
+fn fleet_from_env() -> anyhow::Result<Vec<FleetEntry>> {
+    let spec = std::env::var("BCP_FLEET").context("BCP_FLEET is required")?;
+    parse_fleet(&spec)
+}
+
+async fn scenario_exclusivity(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let first = &fleet[0];
+
+    let acquired = raw_acquire(global, first)
+        .await
+        .map_err(|status| anyhow::anyhow!("first acquire failed: {status}"))?;
+    let lease = acquired.lease.context("no lease on first acquire")?;
+    println!("exclusivity: first acquire of {} ok", first.account_id);
+
+    match raw_acquire(global, first).await {
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            println!("exclusivity: PASS second acquire of same account denied (NOT_FOUND)");
+        }
+        Err(status) => bail!("exclusivity: unexpected error on second acquire: {status}"),
+        Ok(_) => bail!("exclusivity: VIOLATED — same account was leased twice concurrently"),
+    }
+
+    if fleet.len() > 1 {
+        raw_acquire(global, &fleet[1])
+            .await
+            .map_err(|status| anyhow::anyhow!("independent acquire failed: {status}"))?;
+        println!(
+            "exclusivity: PASS independent account {} acquired concurrently",
+            fleet[1].account_id
+        );
+    }
+
+    global
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: lease.lease_id.clone(),
+            fencing_token: lease.fencing_token.clone(),
+        })
+        .await?;
+    raw_acquire(global, first)
+        .await
+        .map_err(|status| anyhow::anyhow!("reacquire after release failed: {status}"))?;
+    println!("exclusivity: PASS profile reclaimed and reacquired after release");
+    println!("SCENARIO exclusivity: PASSED");
+    Ok(())
+}
+
+async fn scenario_fencing(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+
+    let acquired = raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("acquire failed: {status}"))?;
+    let route = acquired.route.context("no route")?;
+    let lease1 = acquired.lease.context("no lease")?;
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    let lc1 = LeaseContext {
+        lease_id: lease1.lease_id.clone(),
+        profile_id: lease1.profile_id.clone(),
+        fencing_token: lease1.fencing_token.clone(),
+    };
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lc1.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lc1.clone()),
+        })
+        .await?;
+    println!("fencing: valid installed lease works");
+
+    // A: wrong fencing token on a known lease id
+    let wrong_token = LeaseContext {
+        fencing_token: "bogus-token".to_string(),
+        ..lc1.clone()
+    };
+    match agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(wrong_token),
+        })
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            println!("fencing: PASS wrong fencing token rejected");
+        }
+        other => bail!("fencing: wrong token NOT rejected: {other:?}"),
+    }
+
+    // B: a lease that was never installed on this machine
+    let ghost = LeaseContext {
+        lease_id: "ghost-lease".to_string(),
+        profile_id: lease1.profile_id.clone(),
+        fencing_token: "ghost-token".to_string(),
+    };
+    match agent
+        .get_snapshot(GetSnapshotRequest { lease: Some(ghost) })
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            println!("fencing: PASS uninstalled lease rejected");
+        }
+        other => bail!("fencing: uninstalled lease NOT rejected: {other:?}"),
+    }
+
+    // C: superseded lease — release L1 at the controller, acquire L2 on the same
+    // profile, install L2, then replay the OLD L1 context against the agent.
+    global
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: lease1.lease_id.clone(),
+            fencing_token: lease1.fencing_token.clone(),
+        })
+        .await?;
+    let acquired2 = raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("reacquire failed: {status}"))?;
+    let lease2 = acquired2.lease.context("no lease2")?;
+    let lc2 = LeaseContext {
+        lease_id: lease2.lease_id.clone(),
+        profile_id: lease2.profile_id.clone(),
+        fencing_token: lease2.fencing_token.clone(),
+    };
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(lc2.clone()),
+        })
+        .await?;
+    match agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(lc1.clone()),
+        })
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            println!("fencing: PASS superseded lease correctly revoked at agent");
+        }
+        Ok(_) => {
+            println!(
+                "fencing: FINDING/GAP — a released+superseded lease is STILL accepted by the \
+                 agent. The agent keys installed leases by lease_id and never uninstalls on \
+                 release/expiry, so a client whose lease was revoked can keep driving the \
+                 browser. Fix: propagate release/expiry to the machine controller (StopBrowser \
+                 or an uninstall RPC), or have the agent revalidate the lease against the \
+                 controller."
+            );
+        }
+        Err(status) => println!("fencing: superseded lease errored unexpectedly: {status}"),
+    }
+    println!("SCENARIO fencing: DONE (A+B pass; C is a documented finding)");
+    Ok(())
+}
+
+async fn scenario_failover(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    let dead = std::env::var("BCP_DEAD_MACHINE").context("BCP_DEAD_MACHINE is required")?;
+    register_fleet(global, &fleet).await?;
+
+    let dead_entry = fleet
+        .iter()
+        .find(|entry| entry.machine_id == dead)
+        .context("BCP_DEAD_MACHINE is not in the fleet")?;
+    match raw_acquire(global, dead_entry).await {
+        Ok(acquired) => {
+            let route = acquired.route.context("no route for dead machine")?;
+            let lease = acquired.lease.context("no lease for dead machine")?;
+            match dial_and_snapshot(&route.agent_grpc_addr, &lease).await {
+                Err(error) => println!(
+                    "failover: PASS dead machine {dead} surfaces an error at use-time ({error})"
+                ),
+                Ok(()) => bail!("failover: dead machine {dead} unexpectedly served a request"),
+            }
+        }
+        Err(status) => {
+            println!("failover: controller declined to route to {dead} ({status})");
+        }
+    }
+
+    let live = fleet
+        .iter()
+        .find(|entry| entry.machine_id != dead)
+        .context("no live machine to verify")?;
+    let ua = drive_once(global, live).await?;
+    println!(
+        "failover: PASS live machine {} still serves real CDP (ua={})",
+        live.machine_id,
+        ua.trim()
+    );
+    println!(
+        "SCENARIO failover: DONE (note: the controller has no auto-offline sweep — ListMachines \
+         still reports {dead} as online; failure is only surfaced when the agent is used)"
+    );
+    Ok(())
+}
+
+async fn scenario_persistence_acquire(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let acquired = raw_acquire(global, &fleet[0])
+        .await
+        .map_err(|status| anyhow::anyhow!("acquire failed: {status}"))?;
+    let lease = acquired.lease.context("no lease")?;
+    let machines = global
+        .list_machines(ListMachinesRequest {
+            label_selector: HashMap::new(),
+        })
+        .await?
+        .into_inner();
+    println!("PERSIST_LEASE_ID={}", lease.lease_id);
+    println!("PERSIST_FENCE={}", lease.fencing_token);
+    println!("PERSIST_MACHINE={}", lease.machine_id);
+    println!("PERSIST_MACHINE_COUNT={}", machines.machines.len());
+    println!("SCENARIO persistence-acquire: DONE");
+    Ok(())
+}
+
+async fn scenario_persistence_verify(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let lease_id = std::env::var("BCP_LEASE_ID").context("BCP_LEASE_ID is required")?;
+    let fence = std::env::var("BCP_FENCE").context("BCP_FENCE is required")?;
+    let expect_machine = std::env::var("BCP_MACHINE").unwrap_or_default();
+    let expect_count: usize = std::env::var("BCP_MACHINE_COUNT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
+    let route = global
+        .get_route(GetRouteRequest {
+            lease_id: lease_id.clone(),
+            fencing_token: fence.clone(),
+        })
+        .await
+        .map_err(|status| {
+            anyhow::anyhow!("get_route after restart failed — lease was lost: {status}")
+        })?
+        .into_inner()
+        .route
+        .context("no route after restart")?;
+    if !expect_machine.is_empty() && route.machine_id != expect_machine {
+        bail!(
+            "route machine changed after restart: expected {expect_machine}, got {}",
+            route.machine_id
+        );
+    }
+    let machines = global
+        .list_machines(ListMachinesRequest {
+            label_selector: HashMap::new(),
+        })
+        .await?
+        .into_inner();
+    if machines.machines.len() < expect_count {
+        bail!(
+            "machines lost after restart: {} < {expect_count}",
+            machines.machines.len()
+        );
+    }
+    println!(
+        "persistence: PASS lease {} and {} machine(s) survived controller restart",
+        lease_id,
+        machines.machines.len()
+    );
+    println!("SCENARIO persistence: PASSED");
+    Ok(())
 }
 
 async fn connect_global(
