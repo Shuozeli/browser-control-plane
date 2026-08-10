@@ -472,12 +472,13 @@ impl PwrightGateway for RealPwrightGateway {
         params: HashMap<String, String>,
     ) -> Result<Vec<RunScriptResponse>, PwrightError> {
         let page = self.page_for_profile(profile_id).await?;
-        let mut source = yaml.to_string();
-        for (key, value) in &params {
-            source = source.replace(&format!("${{{key}}}"), value);
-        }
-        let script: ScriptSpec = serde_yaml::from_str(&source)
+        // Parse first, then substitute params into the parsed string fields, so a
+        // param value cannot inject or reshape the YAML program.
+        let mut script: ScriptSpec = serde_yaml::from_str(yaml)
             .map_err(|error| Self::operation_failed(profile_id, error))?;
+        for step in &mut script.steps {
+            step.apply_params(&params);
+        }
 
         let mut lines = Vec::new();
         for (index, step) in script.steps.iter().enumerate() {
@@ -543,6 +544,29 @@ struct ScriptStep {
     ms: u64,
 }
 
+/// Upper bound on a single `wait_ms` step so a script cannot pin the streaming
+/// handler (and its browser page) for an unbounded time.
+#[cfg(feature = "real-pwright")]
+const MAX_STEP_WAIT_MS: u64 = 60_000;
+
+#[cfg(feature = "real-pwright")]
+impl ScriptStep {
+    /// Substitutes `${key}` occurrences in the string fields with param values,
+    /// after the YAML has been parsed (so params cannot alter the program shape).
+    fn apply_params(&mut self, params: &HashMap<String, String>) {
+        let substitute = |value: &mut String| {
+            for (key, replacement) in params {
+                *value = value.replace(&format!("${{{key}}}"), replacement);
+            }
+        };
+        substitute(&mut self.url);
+        substitute(&mut self.selector);
+        substitute(&mut self.text);
+        substitute(&mut self.key);
+        substitute(&mut self.expression);
+    }
+}
+
 #[cfg(feature = "real-pwright")]
 async fn run_script_step(
     page: &Page,
@@ -589,8 +613,9 @@ async fn run_script_step(
             Ok(serde_json::json!("pressed"))
         }
         "wait_ms" => {
-            tokio::time::sleep(std::time::Duration::from_millis(step.ms)).await;
-            Ok(serde_json::json!(step.ms))
+            let ms = step.ms.min(MAX_STEP_WAIT_MS);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            Ok(serde_json::json!(ms))
         }
         "eval" => {
             let value = page

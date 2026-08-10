@@ -1795,6 +1795,16 @@ async fn scenario_quarantine(
         })
         .await?;
 
+    // Optionally wait so a self-registering agent re-registers (reporting the
+    // profile Available) in between: quarantine must survive that heartbeat.
+    let wait_ms: u64 = std::env::var("BCP_QUARANTINE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if wait_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    }
+
     match raw_acquire(global, entry).await {
         Err(status) if status.code() == tonic::Code::NotFound => {
             println!("quarantine: PASS acquire blocked while quarantined");

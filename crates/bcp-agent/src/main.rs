@@ -429,22 +429,28 @@ fn spawn_telemetry_reporter(service: AgentService) {
             if telemetry.samples.is_empty() && telemetry.events.is_empty() {
                 continue;
             }
-            match GlobalControllerClient::connect(controller.clone()).await {
-                Ok(mut client) => {
-                    if let Err(error) = client
-                        .report_telemetry(ReportTelemetryRequest {
-                            reporter_machine_id: machine_id.clone(),
-                            samples: telemetry.samples,
-                            events: telemetry.events,
-                        })
-                        .await
-                    {
+            let request = ReportTelemetryRequest {
+                reporter_machine_id: machine_id.clone(),
+                samples: telemetry.samples.clone(),
+                events: telemetry.events.clone(),
+            };
+            let sent = match GlobalControllerClient::connect(controller.clone()).await {
+                Ok(mut client) => match client.report_telemetry(request).await {
+                    Ok(_) => true,
+                    Err(error) => {
                         tracing::warn!(%error, controller, "telemetry report failed");
+                        false
                     }
-                }
+                },
                 Err(error) => {
                     tracing::warn!(%error, controller, "telemetry controller unreachable");
+                    false
                 }
+            };
+            // Never drop audit events on a transient controller outage: put the
+            // batch back so the next tick retries it.
+            if !sent {
+                service.requeue_fleet_telemetry(telemetry);
             }
         }
     });

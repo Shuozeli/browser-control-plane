@@ -381,6 +381,16 @@ impl ControllerService {
         if profile.status == ProfileStatus::Unspecified as i32 {
             profile.status = ProfileStatus::Available as i32;
         }
+        // Operator/controller-owned statuses must survive an agent heartbeat: an
+        // agent re-registers reporting `Available`, but a Quarantined or Broken
+        // profile stays out of service until the controller clears it.
+        if let Some(existing) = state.profiles.get(&profile.profile_id) {
+            let operator_owned = existing.status == ProfileStatus::Quarantined as i32
+                || existing.status == ProfileStatus::Broken as i32;
+            if operator_owned {
+                profile.status = existing.status;
+            }
+        }
         if Self::active_lease_for_profile(state, &profile.profile_id).is_some() {
             profile.status = ProfileStatus::Leased as i32;
         }
@@ -1662,6 +1672,56 @@ mod tests {
         // Assert
         assert_eq!(blocked.code(), tonic::Code::NotFound);
         assert!(allowed.is_ok());
+    }
+
+    #[tokio::test]
+    async fn quarantine_survives_agent_reregistration() {
+        // Arrange
+        let service = test_service();
+        let register = || {
+            Request::new(RegisterMachineRequest {
+                machine: Some(Machine {
+                    machine_id: "m1".to_string(),
+                    status: MachineStatus::Online as i32,
+                    ..Default::default()
+                }),
+                profiles: vec![BrowserProfile {
+                    profile_id: "p1".to_string(),
+                    machine_id: "m1".to_string(),
+                    status: ProfileStatus::Available as i32,
+                    accounts: vec![Account {
+                        account_id: "acct".to_string(),
+                        platform: AccountPlatform::Youtube as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            })
+        };
+        service.register_machine(register()).await.unwrap();
+        service
+            .quarantine_profile(Request::new(QuarantineProfileRequest {
+                profile_id: "p1".to_string(),
+                reason: "flaky".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        // Act: the agent re-registers, reporting the profile as Available again.
+        service.register_machine(register()).await.unwrap();
+
+        // Assert: quarantine survived, so acquire is still blocked.
+        let blocked = service
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "c".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "acct".to_string(),
+                ttl_seconds: 60,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code(), tonic::Code::NotFound);
     }
 
     fn sqlite_test_service(path: &std::path::Path) -> ControllerService {

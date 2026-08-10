@@ -26,6 +26,10 @@ pub struct ManagedBrowser {
     pub last_error: String,
 }
 
+/// Upper bound on buffered telemetry so a long controller outage cannot grow the
+/// pending buffer without limit.
+const MAX_PENDING_TELEMETRY: usize = 5000;
+
 #[derive(Debug, Clone, Default)]
 pub struct FleetTelemetry {
     pub samples: Vec<MetricSample>,
@@ -310,6 +314,27 @@ impl BrowserFleetManager {
         );
     }
 
+    /// Restores a telemetry batch that failed to report to the pending buffer so
+    /// the next attempt retries it, rather than silently dropping audit events.
+    /// The failed (older) batch is kept ahead of newer data and the buffer is
+    /// bounded by `MAX_PENDING_TELEMETRY`.
+    pub fn requeue_telemetry(&self, telemetry: FleetTelemetry) {
+        let mut pending = self
+            .pending
+            .write()
+            .expect("browser fleet telemetry lock poisoned");
+
+        let mut events = telemetry.events;
+        events.append(&mut pending.events);
+        events.truncate(MAX_PENDING_TELEMETRY);
+        pending.events = events;
+
+        let mut samples = telemetry.samples;
+        samples.append(&mut pending.samples);
+        samples.truncate(MAX_PENDING_TELEMETRY);
+        pending.samples = samples;
+    }
+
     fn push_sample(&self, sample: MetricSample) {
         self.pending
             .write()
@@ -369,6 +394,29 @@ mod tests {
         let telemetry = manager.drain_telemetry();
         assert_eq!(telemetry.samples[0].name, "bcp.browser.running");
         assert_eq!(telemetry.samples[0].value, 1.0);
+    }
+
+    #[test]
+    fn requeue_restores_drained_telemetry() {
+        // Arrange
+        let clock = Arc::new(FakeClock::new(10_000));
+        let manager = BrowserFleetManager::new(
+            "machine-a",
+            Arc::new(RecordingPwrightGateway::default()),
+            clock,
+        );
+        manager.record_operation("browser.snapshot", "youtube-main", "1 node");
+        let drained = manager.drain_telemetry();
+        assert_eq!(drained.events.len(), 1);
+        assert!(manager.drain_telemetry().events.is_empty());
+
+        // Act: a failed report puts the batch back.
+        manager.requeue_telemetry(drained);
+
+        // Assert
+        let recovered = manager.drain_telemetry();
+        assert_eq!(recovered.events.len(), 1);
+        assert_eq!(recovered.events[0].event_type, "browser.snapshot");
     }
 
     #[tokio::test]

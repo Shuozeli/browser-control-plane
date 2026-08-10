@@ -87,6 +87,10 @@ impl AgentService {
         self.fleet.drain_telemetry()
     }
 
+    pub fn requeue_fleet_telemetry(&self, telemetry: FleetTelemetry) {
+        self.fleet.requeue_telemetry(telemetry);
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn cleanup_expired_artifacts(&self) -> Result<Vec<Artifact>, Status> {
         self.artifacts
