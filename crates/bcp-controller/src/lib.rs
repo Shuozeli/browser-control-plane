@@ -1070,6 +1070,30 @@ impl GlobalController for ControllerService {
         }))
     }
 
+    async fn list_machine_leases(
+        &self,
+        request: Request<ListMachineLeasesRequest>,
+    ) -> Result<Response<ListMachineLeasesResponse>, Status> {
+        let request = request.into_inner();
+        if request.machine_id.is_empty() {
+            return Err(Status::invalid_argument("machine_id is required"));
+        }
+        let now = self.clock.now_unix_ms();
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let leases = state
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.machine_id == request.machine_id && lease.expires_at_unix_ms > now
+            })
+            .cloned()
+            .collect();
+        Ok(Response::new(ListMachineLeasesResponse { leases }))
+    }
+
     async fn get_route(
         &self,
         request: Request<GetRouteRequest>,
@@ -1777,6 +1801,65 @@ mod tests {
             lease.expires_at_unix_ms,
             1_000 + MAX_LEASE_TTL_SECONDS * 1000
         );
+    }
+
+    #[tokio::test]
+    async fn list_machine_leases_returns_only_active_leases_for_machine() {
+        // Arrange
+        let service = test_service();
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(Machine {
+                    machine_id: "m1".to_string(),
+                    status: MachineStatus::Online as i32,
+                    ..Default::default()
+                }),
+                profiles: vec![BrowserProfile {
+                    profile_id: "p1".to_string(),
+                    machine_id: "m1".to_string(),
+                    status: ProfileStatus::Available as i32,
+                    accounts: vec![Account {
+                        account_id: "acct".to_string(),
+                        platform: AccountPlatform::Youtube as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .unwrap();
+        let acquired = service
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "c".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "acct".to_string(),
+                ttl_seconds: 60,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Act + Assert: the owning machine sees exactly its lease.
+        let owned = service
+            .list_machine_leases(Request::new(ListMachineLeasesRequest {
+                machine_id: "m1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(owned.leases.len(), 1);
+        assert_eq!(owned.leases[0].lease_id, acquired.lease.unwrap().lease_id);
+
+        // A different machine sees none.
+        let other = service
+            .list_machine_leases(Request::new(ListMachineLeasesRequest {
+                machine_id: "m2".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(other.leases.is_empty());
     }
 
     #[tokio::test]

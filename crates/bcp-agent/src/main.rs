@@ -14,8 +14,8 @@ use bcp_core::pwright::{RecordingProfileState, RecordingPwrightGateway};
 use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerClient;
 use bcp_proto::browsercontrol::v1::machine_controller_server::MachineControllerServer;
 use bcp_proto::browsercontrol::v1::{
-    A11yNode, Account, AccountPlatform, BrowserProfile, Machine, MachineStatus, ProfileStatus,
-    RegisterMachineRequest, ReportTelemetryRequest,
+    A11yNode, Account, AccountPlatform, BrowserProfile, ListMachineLeasesRequest, Machine,
+    MachineStatus, ProfileStatus, RegisterMachineRequest, ReportTelemetryRequest,
 };
 use clap::Parser;
 use prost::Message;
@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_artifact_cleanup(service.clone());
     spawn_controller_registration(service.clone(), addr, runtime.machine_labels);
     spawn_telemetry_reporter(service.clone());
+    spawn_lease_sync(service.clone());
 
     tonic::transport::Server::builder()
         .add_service(MachineControllerServer::new(service))
@@ -407,6 +408,48 @@ fn spawn_fleet_heartbeat(service: AgentService) {
         loop {
             interval.tick().await;
             service.reconcile_fleet_once().await;
+        }
+    });
+}
+
+fn spawn_lease_sync(service: AgentService) {
+    let Ok(controller) = std::env::var("BCP_CONTROLLER") else {
+        return;
+    };
+    let interval_seconds = std::env::var("BCP_LEASE_SYNC_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let machine_id = service.machine_id();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        loop {
+            interval.tick().await;
+            let connect = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                GlobalControllerClient::connect(controller.clone()),
+            )
+            .await;
+            let Ok(Ok(mut client)) = connect else {
+                continue;
+            };
+            match client
+                .list_machine_leases(ListMachineLeasesRequest {
+                    machine_id: machine_id.clone(),
+                })
+                .await
+            {
+                // Reconcile the local install map to the controller's authoritative
+                // lease set: recovers leases after an agent restart and prunes any
+                // the controller no longer holds.
+                Ok(response) => {
+                    let leases = response.into_inner().leases;
+                    tracing::debug!(machine_id, count = leases.len(), "lease sync reconciled");
+                    service.sync_leases(&leases);
+                }
+                Err(error) => tracing::warn!(%error, controller, "lease sync failed"),
+            }
         }
     });
 }

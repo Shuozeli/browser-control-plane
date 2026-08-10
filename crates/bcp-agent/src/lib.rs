@@ -95,6 +95,31 @@ impl AgentService {
         self.fleet.requeue_telemetry(telemetry);
     }
 
+    /// Reconciles the local installed-lease map to the controller's authoritative
+    /// set of active leases for this machine: installs any that are missing (so a
+    /// restarted agent recovers its leases) and drops any the controller no longer
+    /// holds (so revocation is reliable even if the uninstall RPC was missed). The
+    /// controller can never hold a lease this agent has not seen, so pruning only
+    /// ever removes released/expired leases.
+    pub fn sync_leases(&self, desired: &[BrowserLease]) {
+        let mut leases = self.leases.write().expect("agent lease lock poisoned");
+        let desired_ids: std::collections::HashSet<&str> = desired
+            .iter()
+            .map(|lease| lease.lease_id.as_str())
+            .collect();
+        leases.retain(|lease_id, _| desired_ids.contains(lease_id.as_str()));
+        for lease in desired {
+            leases.insert(
+                lease.lease_id.clone(),
+                LocalLease {
+                    profile_id: lease.profile_id.clone(),
+                    fencing_token: lease.fencing_token.clone(),
+                    expires_at_unix_ms: lease.expires_at_unix_ms,
+                },
+            );
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn cleanup_expired_artifacts(&self) -> Result<Vec<Artifact>, Status> {
         self.artifacts
@@ -715,6 +740,44 @@ mod tests {
             "an expired lease must be rejected even without a revocation RPC"
         );
         assert!(live.is_ok());
+    }
+
+    #[test]
+    fn sync_leases_reconciles_install_map() {
+        // Arrange: a stale local lease that the controller no longer holds.
+        let service = AgentService::new(Arc::new(EmptyPwrightGateway));
+        service.install_lease("stale", "p1", "token-stale", 0);
+        let context = |lease_id: &str, token: &str| {
+            Some(LeaseContext {
+                lease_id: lease_id.to_string(),
+                profile_id: "p1".to_string(),
+                fencing_token: token.to_string(),
+                expires_at_unix_ms: 0,
+            })
+        };
+
+        // Act: reconcile to the controller's authoritative set (only "fresh").
+        service.sync_leases(&[BrowserLease {
+            lease_id: "fresh".to_string(),
+            profile_id: "p1".to_string(),
+            machine_id: "m".to_string(),
+            fencing_token: "token-fresh".to_string(),
+            expires_at_unix_ms: 0,
+            ..Default::default()
+        }]);
+
+        // Assert: the stale lease is pruned; the controller's lease is installed.
+        assert!(
+            service
+                .validate_lease(context("stale", "token-stale"))
+                .is_err()
+        );
+        assert_eq!(
+            service
+                .validate_lease(context("fresh", "token-fresh"))
+                .unwrap(),
+            "p1"
+        );
     }
 
     #[tokio::test]

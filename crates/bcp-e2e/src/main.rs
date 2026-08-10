@@ -1525,6 +1525,8 @@ async fn scenarios_main() -> anyhow::Result<()> {
         "quarantine" => scenario_quarantine(&mut global).await,
         "audit" => scenario_audit(&mut global).await,
         "lease-expiry" => scenario_lease_expiry(&mut global).await,
+        "restart-hold" => scenario_restart_hold(&mut global).await,
+        "restart-check" => scenario_restart_check().await,
         "failover" => scenario_failover(&mut global).await,
         "persistence-acquire" => scenario_persistence_acquire(&mut global).await,
         "persistence-verify" => scenario_persistence_verify(&mut global).await,
@@ -1948,6 +1950,81 @@ async fn scenario_lease_expiry(
         Err(status) => bail!("lease-expiry: unexpected status: {status}"),
     }
     println!("SCENARIO lease-expiry: PASSED");
+    Ok(())
+}
+
+/// Phase 1 of the restart-recovery check: acquire a lease, install it, prove it
+/// works, and print its details for phase 2. The lease is intentionally NOT
+/// released so it survives an agent restart.
+async fn scenario_restart_hold(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "restart-e2e".to_string(),
+            purpose: "verify-restart-recovery".to_string(),
+            platform: entry.platform as i32,
+            account_id: entry.account_id.clone(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 300,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("no route")?;
+    let lease = acquired.lease.context("no lease")?;
+    let context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(context.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context),
+        })
+        .await?;
+    println!("HELD_LEASE_ID={}", lease.lease_id);
+    println!("HELD_FENCE={}", lease.fencing_token);
+    println!("HELD_PROFILE={}", lease.profile_id);
+    println!("HELD_EXPIRES={}", lease.expires_at_unix_ms);
+    println!("HELD_AGENT={}", route.agent_grpc_addr);
+    println!("SCENARIO restart-hold: DONE");
+    Ok(())
+}
+
+/// Phase 2: after the owning agent has been restarted, the held lease must still
+/// work because the agent reconciled it from the controller on startup.
+async fn scenario_restart_check() -> anyhow::Result<()> {
+    let agent_addr = std::env::var("BCP_AGENT").context("BCP_AGENT is required")?;
+    let context = LeaseContext {
+        lease_id: std::env::var("BCP_LEASE_ID").context("BCP_LEASE_ID is required")?,
+        profile_id: std::env::var("BCP_PROFILE").context("BCP_PROFILE is required")?,
+        fencing_token: std::env::var("BCP_FENCE").context("BCP_FENCE is required")?,
+        expires_at_unix_ms: std::env::var("BCP_EXPIRES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    };
+    let mut agent = connect_agent(&agent_addr).await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context),
+        })
+        .await
+        .map_err(|status| {
+            anyhow::anyhow!("lease did not survive the agent restart (not reconciled): {status}")
+        })?;
+    println!("restart-check: PASS held lease works after agent restart (reconciled)");
+    println!("SCENARIO restart-check: PASSED");
     Ok(())
 }
 

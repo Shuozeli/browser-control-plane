@@ -70,10 +70,11 @@
       depends on the revocation RPC landing), TTL clamp + checked math, sweep
       persistence gating, bounded telemetry (events/metrics caps + retry), lock
       poison recovery, and connect timeouts on controller<->agent dials.
-- [ ] Controller-owned lease install / agent lease recovery on restart. Today
-      only clients call `install_lease`; if an agent restarts, its in-memory
-      lease map is empty and the profile is stuck `Leased` until TTL. Have the
-      controller install/reconcile leases, or agents re-fetch on startup.
+- [x] Agent lease recovery on restart. Agents pull-reconcile their active leases
+      from the controller (`ListMachineLeases`) on startup and every few seconds:
+      a restarted agent recovers its install map, and released/expired leases the
+      controller no longer holds are pruned locally (self-healing revocation that
+      no longer depends on the best-effort uninstall RPC).
 - [ ] Add retry policy for controller-to-agent sync (partly addressed: dials now
       time out; still no durable retry/queue for revocation).
 - [ ] Add integration tests with fake machine controllers.

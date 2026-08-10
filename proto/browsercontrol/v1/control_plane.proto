@@ -21,6 +21,10 @@ service GlobalController {
   rpc QuarantineProfile(QuarantineProfileRequest) returns (QuarantineProfileResponse);
   rpc ReleaseQuarantine(ReleaseQuarantineRequest) returns (ReleaseQuarantineResponse);
 
+  // Active (non-expired) leases owned by a machine, so a machine controller can
+  // reconcile its local install map on startup and periodically.
+  rpc ListMachineLeases(ListMachineLeasesRequest) returns (ListMachineLeasesResponse);
+
   rpc ReportTelemetry(ReportTelemetryRequest) returns (ReportTelemetryResponse);
   rpc GetMetricSummary(GetMetricSummaryRequest) returns (GetMetricSummaryResponse);
   rpc ListControlPlaneEvents(ListControlPlaneEventsRequest) returns (ListControlPlaneEventsResponse);
@@ -287,6 +291,14 @@ message ReleaseQuarantineRequest {
 
 message ReleaseQuarantineResponse {
   BrowserProfile profile = 1;
+}
+
+message ListMachineLeasesRequest {
+  string machine_id = 1;
+}
+
+message ListMachineLeasesResponse {
+  repeated BrowserLease leases = 1;
 }
 
 message MetricSample {
