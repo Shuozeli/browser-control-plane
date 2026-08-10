@@ -18,6 +18,9 @@ service GlobalController {
   rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
   rpc GetRoute(GetRouteRequest) returns (GetRouteResponse);
 
+  rpc QuarantineProfile(QuarantineProfileRequest) returns (QuarantineProfileResponse);
+  rpc ReleaseQuarantine(ReleaseQuarantineRequest) returns (ReleaseQuarantineResponse);
+
   rpc ReportTelemetry(ReportTelemetryRequest) returns (ReportTelemetryResponse);
   rpc GetMetricSummary(GetMetricSummaryRequest) returns (GetMetricSummaryResponse);
   rpc ListControlPlaneEvents(ListControlPlaneEventsRequest) returns (ListControlPlaneEventsResponse);
@@ -267,6 +270,23 @@ message GetRouteRequest {
 
 message GetRouteResponse {
   BrowserRoute route = 1;
+}
+
+message QuarantineProfileRequest {
+  string profile_id = 1;
+  string reason = 2;
+}
+
+message QuarantineProfileResponse {
+  BrowserProfile profile = 1;
+}
+
+message ReleaseQuarantineRequest {
+  string profile_id = 1;
+}
+
+message ReleaseQuarantineResponse {
+  BrowserProfile profile = 1;
 }
 
 message MetricSample {

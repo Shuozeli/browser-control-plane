@@ -43,7 +43,9 @@
 - [x] Implement script proxy. The real gateway now executes a YAML step program
       (goto / click / fill / type / press / eval / wait_ms) against the page and
       streams a JSON result per step, with `${param}` substitution.
-- [ ] Add structured audit events for all browser operations.
+- [x] Add structured audit events for all browser operations. Snapshot, action,
+      eval, and run_script emit a `browser.*` `ControlPlaneEvent` that the agent
+      reports to the controller, queryable via `ListControlPlaneEvents`.
 
 ## Phase 4: Client
 
@@ -58,14 +60,18 @@
 
 - [x] Add stale machine detection. A background sweep marks a machine offline
       once its registration heartbeat is older than `BCP_MACHINE_OFFLINE_MS`.
-- [ ] Add stale lease cleanup.
-- [ ] Add profile quarantine.
+- [x] Add stale lease cleanup. The sweep reclaims expired leases and leases whose
+      machine went offline, freeing the profile and revoking the lease at the agent.
+- [x] Add profile quarantine. `QuarantineProfile` / `ReleaseQuarantine` mark a
+      profile quarantined (evicting any active lease) so it is excluded from
+      acquire until released.
 - [ ] Add retry policy for controller-to-agent sync.
 - [ ] Add integration tests with fake machine controllers.
 - [x] Turn Docker multi-network topology skeleton into a runnable e2e suite.
 - [x] Add a real VirtualBox VM fleet test (`tests/vm-fleet`) plus `bcp-e2e`
       `vm-fleet` and `scenarios` (exclusivity / fencing / fencing-release /
-      auto-offline / failover / persistence) modes driven by `BCP_FLEET`.
+      auto-offline / quarantine / audit / failover / persistence) modes driven
+      by `BCP_FLEET`.
 
 ## Phase 5.5: Observability
 

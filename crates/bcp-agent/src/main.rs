@@ -15,7 +15,7 @@ use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerCli
 use bcp_proto::browsercontrol::v1::machine_controller_server::MachineControllerServer;
 use bcp_proto::browsercontrol::v1::{
     A11yNode, Account, AccountPlatform, BrowserProfile, Machine, MachineStatus, ProfileStatus,
-    RegisterMachineRequest,
+    RegisterMachineRequest, ReportTelemetryRequest,
 };
 use clap::Parser;
 use prost::Message;
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_fleet_heartbeat(service.clone());
     spawn_artifact_cleanup(service.clone());
     spawn_controller_registration(service.clone(), addr, runtime.machine_labels);
+    spawn_telemetry_reporter(service.clone());
 
     tonic::transport::Server::builder()
         .add_service(MachineControllerServer::new(service))
@@ -406,6 +407,45 @@ fn spawn_fleet_heartbeat(service: AgentService) {
         loop {
             interval.tick().await;
             service.reconcile_fleet_once().await;
+        }
+    });
+}
+
+fn spawn_telemetry_reporter(service: AgentService) {
+    let Ok(controller) = std::env::var("BCP_CONTROLLER") else {
+        return;
+    };
+    let interval_seconds = std::env::var("BCP_TELEMETRY_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5)
+        .max(1);
+    let machine_id = service.machine_id();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        loop {
+            interval.tick().await;
+            let telemetry = service.drain_fleet_telemetry();
+            if telemetry.samples.is_empty() && telemetry.events.is_empty() {
+                continue;
+            }
+            match GlobalControllerClient::connect(controller.clone()).await {
+                Ok(mut client) => {
+                    if let Err(error) = client
+                        .report_telemetry(ReportTelemetryRequest {
+                            reporter_machine_id: machine_id.clone(),
+                            samples: telemetry.samples,
+                            events: telemetry.events,
+                        })
+                        .await
+                    {
+                        tracing::warn!(%error, controller, "telemetry report failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, controller, "telemetry controller unreachable");
+                }
+            }
         }
     });
 }

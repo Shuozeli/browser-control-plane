@@ -274,6 +274,11 @@ impl MachineController for AgentService {
             .get_snapshot(&profile_id)
             .await
             .map_err(Self::pwright_error_to_status)?;
+        self.fleet.record_operation(
+            "browser.snapshot",
+            &profile_id,
+            &format!("snapshot returned {} nodes", nodes.len()),
+        );
         Ok(Response::new(GetSnapshotResponse { nodes }))
     }
 
@@ -283,11 +288,14 @@ impl MachineController for AgentService {
     ) -> Result<Response<ExecuteActionResponse>, Status> {
         let request = request.into_inner();
         let profile_id = self.validate_lease(request.lease.clone())?;
+        let action = request.action.clone();
         let response = self
             .pwright
             .execute_action(&profile_id, request)
             .await
             .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.action", &profile_id, &action);
         Ok(Response::new(response))
     }
 
@@ -302,6 +310,8 @@ impl MachineController for AgentService {
             .evaluate(&profile_id, &request.expression)
             .await
             .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.eval", &profile_id, "evaluate expression");
         Ok(Response::new(EvaluateResponse { json_result }))
     }
 
@@ -324,6 +334,11 @@ impl MachineController for AgentService {
             .run_script(&profile_id, &request.yaml, request.params)
             .await
             .map_err(Self::pwright_error_to_status)?;
+        self.fleet.record_operation(
+            "browser.run_script",
+            &profile_id,
+            &format!("ran script with {} result line(s)", lines.len()),
+        );
         let stream = tonic::codegen::tokio_stream::iter(lines.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }

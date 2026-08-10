@@ -5,7 +5,8 @@ use bcp_proto::browsercontrol::v1::machine_controller_client::MachineControllerC
 use bcp_proto::browsercontrol::v1::{
     AccountPlatform, AcquireBrowserRequest, BrowserLease, BrowserRoute, EnsureBrowserRequest,
     EvaluateRequest, GetRouteRequest, GetSnapshotRequest, InstallLeaseRequest, LeaseContext,
-    ListMachinesRequest, LookupBrowserConnectionRequest, ReleaseLeaseRequest, RunScriptRequest,
+    ListControlPlaneEventsRequest, ListMachinesRequest, LookupBrowserConnectionRequest,
+    QuarantineProfileRequest, ReleaseLeaseRequest, ReleaseQuarantineRequest, RunScriptRequest,
 };
 use clap::{Parser, Subcommand};
 
@@ -87,6 +88,25 @@ enum Command {
         /// Path to a YAML script file.
         #[arg(long)]
         file: std::path::PathBuf,
+    },
+    /// Quarantine a profile so it is no longer selected for acquire.
+    Quarantine {
+        #[arg(long)]
+        profile_id: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+    /// Release a profile from quarantine.
+    Unquarantine {
+        #[arg(long)]
+        profile_id: String,
+    },
+    /// List recent structured control-plane events (browser audit log).
+    Events {
+        #[arg(long, default_value = "")]
+        machine_id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: i32,
     },
 }
 
@@ -274,6 +294,55 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", line.json_line);
             }
             release(&mut controller, &lease).await;
+        }
+        Command::Quarantine { profile_id, reason } => {
+            let mut client = GlobalControllerClient::connect(args.controller).await?;
+            let profile = client
+                .quarantine_profile(QuarantineProfileRequest { profile_id, reason })
+                .await?
+                .into_inner()
+                .profile
+                .ok_or_else(|| anyhow::anyhow!("quarantine response did not include profile"))?;
+            println!(
+                "profile_id={} status={}",
+                profile.profile_id, profile.status
+            );
+        }
+        Command::Unquarantine { profile_id } => {
+            let mut client = GlobalControllerClient::connect(args.controller).await?;
+            let profile = client
+                .release_quarantine(ReleaseQuarantineRequest { profile_id })
+                .await?
+                .into_inner()
+                .profile
+                .ok_or_else(|| anyhow::anyhow!("unquarantine response did not include profile"))?;
+            println!(
+                "profile_id={} status={}",
+                profile.profile_id, profile.status
+            );
+        }
+        Command::Events { machine_id, limit } => {
+            let mut client = GlobalControllerClient::connect(args.controller).await?;
+            let events = client
+                .list_control_plane_events(ListControlPlaneEventsRequest {
+                    start_unix_ms: 0,
+                    end_unix_ms: 0,
+                    machine_id,
+                    profile_id: String::new(),
+                    limit,
+                })
+                .await?
+                .into_inner();
+            for event in events.events {
+                println!(
+                    "{} {} machine={} profile={} {}",
+                    event.observed_at_unix_ms,
+                    event.event_type,
+                    event.machine_id,
+                    event.profile_id,
+                    event.message
+                );
+            }
         }
     }
     Ok(())

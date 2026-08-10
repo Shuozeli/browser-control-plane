@@ -295,6 +295,21 @@ impl BrowserFleetManager {
             });
     }
 
+    /// Records a structured audit event for a browser operation executed
+    /// through the machine controller. Flushed to the global controller with the
+    /// rest of the fleet telemetry.
+    pub fn record_operation(&self, event_type: &str, profile_id: &str, message: &str) {
+        let now = self.clock.now_unix_ms();
+        self.record_event(
+            event_type,
+            EventSeverity::Info,
+            profile_id,
+            now,
+            message,
+            HashMap::new(),
+        );
+    }
+
     fn push_sample(&self, sample: MetricSample) {
         self.pending
             .write()

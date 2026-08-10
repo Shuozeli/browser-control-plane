@@ -107,5 +107,7 @@ BCP_LEASE_ID=... BCP_FENCE=... BCP_MACHINE=a1 BCP_MACHINE_COUNT=3 \
 | `fencing` | a wrong fencing token and an uninstalled lease are rejected; a **released+superseded** lease is revoked at the agent (regression test for the single-active-lease-per-profile fix) |
 | `fencing-release` | releasing a lease revokes it at the agent even with no successor (the controller pushes `UninstallLease`) |
 | `auto-offline` | the controller's background sweep marks stale machines offline (run the controller with low `BCP_MACHINE_OFFLINE_MS` / `BCP_SWEEP_SECONDS`) |
+| `quarantine` | a quarantined profile is evicted and excluded from acquire until released |
+| `audit` | browser operations emit `browser.*` audit events the agent reports to the controller (needs self-registering agents) |
 | `failover` | a downed machine surfaces an error at use-time (no hang) while live machines keep serving |
 | `persistence` | an active lease and the registered machines survive a controller restart (SQLite reload) |

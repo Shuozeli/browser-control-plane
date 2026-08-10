@@ -1511,6 +1511,8 @@ async fn scenarios_main() -> anyhow::Result<()> {
         "fencing" => scenario_fencing(&mut global).await,
         "fencing-release" => scenario_fencing_release(&mut global).await,
         "auto-offline" => scenario_auto_offline(&mut global).await,
+        "quarantine" => scenario_quarantine(&mut global).await,
+        "audit" => scenario_audit(&mut global).await,
         "failover" => scenario_failover(&mut global).await,
         "persistence-acquire" => scenario_persistence_acquire(&mut global).await,
         "persistence-verify" => scenario_persistence_verify(&mut global).await,
@@ -1769,6 +1771,96 @@ async fn scenario_auto_offline(
     }
     println!("auto-offline: PASS the sweep marked {offline} stale machine(s) offline");
     println!("SCENARIO auto-offline: PASSED");
+    Ok(())
+}
+
+/// Proves a quarantined profile is evicted and excluded from acquire until it is
+/// released back to service.
+async fn scenario_quarantine(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+    let profile_id = format!("{}-profile", entry.machine_id);
+
+    // Lease it first so quarantine also has to evict an active lease.
+    raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("initial acquire failed: {status}"))?;
+    global
+        .quarantine_profile(QuarantineProfileRequest {
+            profile_id: profile_id.clone(),
+            reason: "scenario".to_string(),
+        })
+        .await?;
+
+    match raw_acquire(global, entry).await {
+        Err(status) if status.code() == tonic::Code::NotFound => {
+            println!("quarantine: PASS acquire blocked while quarantined");
+        }
+        Ok(_) => bail!("quarantine: acquire succeeded on a quarantined profile"),
+        Err(status) => bail!("quarantine: unexpected error: {status}"),
+    }
+
+    global
+        .release_quarantine(ReleaseQuarantineRequest {
+            profile_id: profile_id.clone(),
+        })
+        .await?;
+    raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("reacquire after release failed: {status}"))?;
+    println!("quarantine: PASS profile acquirable again after release");
+    println!("SCENARIO quarantine: PASSED");
+    Ok(())
+}
+
+/// Proves browser operations produce structured audit events that the agent
+/// reports to the controller (requires self-registering agents so their
+/// telemetry reporter is active).
+async fn scenario_audit(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+
+    // Drive a real browser operation, which emits browser.* audit events.
+    drive_once(global, entry).await?;
+
+    let wait_ms: u64 = std::env::var("BCP_AUDIT_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8000);
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+
+    let events = global
+        .list_control_plane_events(ListControlPlaneEventsRequest {
+            start_unix_ms: 0,
+            end_unix_ms: 0,
+            machine_id: entry.machine_id.clone(),
+            profile_id: String::new(),
+            limit: 200,
+        })
+        .await?
+        .into_inner();
+    let browser_events = events
+        .events
+        .iter()
+        .filter(|event| event.event_type.starts_with("browser."))
+        .count();
+    if browser_events == 0 {
+        bail!(
+            "no browser.* audit events reported to the controller for {}",
+            entry.machine_id
+        );
+    }
+    println!(
+        "audit: PASS {browser_events} browser audit event(s) reported for {}",
+        entry.machine_id
+    );
+    println!("SCENARIO audit: PASSED");
     Ok(())
 }
 

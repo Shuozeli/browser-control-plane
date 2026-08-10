@@ -171,23 +171,11 @@ impl ControllerService {
     /// Returns the leases that expired so callers/tests can observe them; each is
     /// also revoked at its agent.
     fn sweep_at(&self, now_unix_ms: i64, offline_after_ms: i64) -> Vec<BrowserLease> {
-        let expired = {
+        let revoked = {
             let mut state = self.state.write().expect("controller state lock poisoned");
             let mut next_state = state.clone();
-            let expired: Vec<BrowserLease> = next_state
-                .leases
-                .values()
-                .filter(|lease| lease.expires_at_unix_ms <= now_unix_ms)
-                .cloned()
-                .collect();
-            for lease in &expired {
-                next_state.leases.remove(&lease.lease_id);
-                if let Some(profile) = next_state.profiles.get_mut(&lease.profile_id)
-                    && profile.status == ProfileStatus::Leased as i32
-                {
-                    profile.status = ProfileStatus::Available as i32;
-                }
-            }
+
+            // Mark machines offline once their registration heartbeat goes stale.
             for machine in next_state.machines.values_mut() {
                 if machine.status == MachineStatus::Online as i32
                     && machine.last_heartbeat_unix_ms > 0
@@ -196,14 +184,41 @@ impl ControllerService {
                     machine.status = MachineStatus::Offline as i32;
                 }
             }
+
+            // Reclaim leases that expired or whose machine went offline: neither
+            // can serve work, so free the profile and revoke the lease.
+            let offline_machines: std::collections::HashSet<String> = next_state
+                .machines
+                .values()
+                .filter(|machine| machine.status == MachineStatus::Offline as i32)
+                .map(|machine| machine.machine_id.clone())
+                .collect();
+            let revoked: Vec<BrowserLease> = next_state
+                .leases
+                .values()
+                .filter(|lease| {
+                    lease.expires_at_unix_ms <= now_unix_ms
+                        || offline_machines.contains(&lease.machine_id)
+                })
+                .cloned()
+                .collect();
+            for lease in &revoked {
+                next_state.leases.remove(&lease.lease_id);
+                if let Some(profile) = next_state.profiles.get_mut(&lease.profile_id)
+                    && profile.status == ProfileStatus::Leased as i32
+                {
+                    profile.status = ProfileStatus::Available as i32;
+                }
+            }
+
             let _ = self.persist_state(&next_state);
             *state = next_state;
-            expired
+            revoked
         };
-        for lease in &expired {
+        for lease in &revoked {
             self.notify_agent_uninstall(lease);
         }
-        expired
+        revoked
     }
 
     pub fn web_snapshot(&self) -> web::ControllerWebSnapshot {
@@ -908,6 +923,76 @@ impl GlobalController for ControllerService {
         Ok(Response::new(ReleaseLeaseResponse { released: true }))
     }
 
+    async fn quarantine_profile(
+        &self,
+        request: Request<QuarantineProfileRequest>,
+    ) -> Result<Response<QuarantineProfileResponse>, Status> {
+        let request = request.into_inner();
+        if request.profile_id.is_empty() {
+            return Err(Status::invalid_argument("profile_id is required"));
+        }
+        let now = self.clock.now_unix_ms();
+        let (profile, evicted) = {
+            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut next_state = state.clone();
+            Self::mark_expired_leases(&mut next_state, now);
+            let profile = {
+                let profile = next_state
+                    .profiles
+                    .get_mut(&request.profile_id)
+                    .ok_or_else(|| Status::not_found("profile not found"))?;
+                profile.status = ProfileStatus::Quarantined as i32;
+                profile.clone()
+            };
+            // A quarantined profile must not keep serving: evict any active lease.
+            let evicted: Vec<BrowserLease> = next_state
+                .leases
+                .values()
+                .filter(|lease| lease.profile_id == request.profile_id)
+                .cloned()
+                .collect();
+            for lease in &evicted {
+                next_state.leases.remove(&lease.lease_id);
+            }
+            self.persist_state(&next_state)?;
+            *state = next_state;
+            (profile, evicted)
+        };
+        for lease in &evicted {
+            self.notify_agent_uninstall(lease);
+        }
+        Ok(Response::new(QuarantineProfileResponse {
+            profile: Some(profile),
+        }))
+    }
+
+    async fn release_quarantine(
+        &self,
+        request: Request<ReleaseQuarantineRequest>,
+    ) -> Result<Response<ReleaseQuarantineResponse>, Status> {
+        let request = request.into_inner();
+        if request.profile_id.is_empty() {
+            return Err(Status::invalid_argument("profile_id is required"));
+        }
+        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut next_state = state.clone();
+        let profile = {
+            let profile = next_state
+                .profiles
+                .get_mut(&request.profile_id)
+                .ok_or_else(|| Status::not_found("profile not found"))?;
+            if profile.status == ProfileStatus::Quarantined as i32 {
+                profile.status = ProfileStatus::Available as i32;
+            }
+            profile.clone()
+        };
+        self.persist_state(&next_state)?;
+        *state = next_state;
+        Ok(Response::new(ReleaseQuarantineResponse {
+            profile: Some(profile),
+        }))
+    }
+
     async fn get_route(
         &self,
         request: Request<GetRouteRequest>,
@@ -1520,6 +1605,63 @@ mod tests {
             .find(|machine| machine.machine_id == "m1")
             .unwrap();
         assert_eq!(machine.status, MachineStatus::Offline as i32);
+    }
+
+    #[tokio::test]
+    async fn quarantine_blocks_acquire_until_released() {
+        // Arrange
+        let service = test_service();
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(Machine {
+                    machine_id: "m1".to_string(),
+                    status: MachineStatus::Online as i32,
+                    ..Default::default()
+                }),
+                profiles: vec![BrowserProfile {
+                    profile_id: "p1".to_string(),
+                    machine_id: "m1".to_string(),
+                    status: ProfileStatus::Available as i32,
+                    accounts: vec![Account {
+                        account_id: "acct".to_string(),
+                        platform: AccountPlatform::Youtube as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .unwrap();
+        let acquire = || {
+            Request::new(AcquireBrowserRequest {
+                client_id: "c".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "acct".to_string(),
+                ttl_seconds: 60,
+                ..Default::default()
+            })
+        };
+
+        // Act
+        service
+            .quarantine_profile(Request::new(QuarantineProfileRequest {
+                profile_id: "p1".to_string(),
+                reason: "flaky".to_string(),
+            }))
+            .await
+            .unwrap();
+        let blocked = service.acquire_browser(acquire()).await.unwrap_err();
+        service
+            .release_quarantine(Request::new(ReleaseQuarantineRequest {
+                profile_id: "p1".to_string(),
+            }))
+            .await
+            .unwrap();
+        let allowed = service.acquire_browser(acquire()).await;
+
+        // Assert
+        assert_eq!(blocked.code(), tonic::Code::NotFound);
+        assert!(allowed.is_ok());
     }
 
     fn sqlite_test_service(path: &std::path::Path) -> ControllerService {
