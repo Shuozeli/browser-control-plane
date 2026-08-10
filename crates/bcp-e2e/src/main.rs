@@ -71,6 +71,7 @@ async fn recording_main() -> anyhow::Result<()> {
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     routed_agent
         .install_lease(InstallLeaseRequest {
@@ -263,6 +264,7 @@ readiness_url = "recording://skip"
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut routed_agent = connect_agent(&route.agent_grpc_addr).await?;
     routed_agent
@@ -377,6 +379,7 @@ async fn fake_failures_main() -> anyhow::Result<()> {
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut routed_agent = connect_agent(&route.agent_grpc_addr).await?;
     routed_agent
@@ -455,6 +458,7 @@ async fn fake_failures_main() -> anyhow::Result<()> {
         lease_id: new_lease.lease_id.clone(),
         profile_id: new_lease.profile_id.clone(),
         fencing_token: new_lease.fencing_token.clone(),
+        expires_at_unix_ms: new_lease.expires_at_unix_ms,
     };
     restarted_agent_client
         .install_lease(InstallLeaseRequest {
@@ -480,6 +484,7 @@ async fn fake_failures_main() -> anyhow::Result<()> {
         lease_id: restored_lease.lease_id,
         profile_id: restored_lease.profile_id,
         fencing_token: restored_lease.fencing_token,
+        expires_at_unix_ms: restored_lease.expires_at_unix_ms,
     };
     restarted_agent_client
         .install_lease(InstallLeaseRequest {
@@ -730,6 +735,7 @@ async fn exercise_wsj_profile(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
     agent
@@ -813,6 +819,7 @@ async fn exercise_hn_profile(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
     agent
@@ -892,6 +899,7 @@ async fn exercise_real_profile(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
     agent
@@ -1342,6 +1350,7 @@ async fn exercise_vm_profile(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
 
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
@@ -1446,6 +1455,7 @@ async fn drive_once(
         lease_id: lease.lease_id,
         profile_id: lease.profile_id,
         fencing_token: lease.fencing_token,
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
     agent
@@ -1486,6 +1496,7 @@ async fn dial_and_snapshot(addr: &str, lease: &BrowserLease) -> anyhow::Result<(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     agent
         .install_lease(InstallLeaseRequest {
@@ -1513,6 +1524,7 @@ async fn scenarios_main() -> anyhow::Result<()> {
         "auto-offline" => scenario_auto_offline(&mut global).await,
         "quarantine" => scenario_quarantine(&mut global).await,
         "audit" => scenario_audit(&mut global).await,
+        "lease-expiry" => scenario_lease_expiry(&mut global).await,
         "failover" => scenario_failover(&mut global).await,
         "persistence-acquire" => scenario_persistence_acquire(&mut global).await,
         "persistence-verify" => scenario_persistence_verify(&mut global).await,
@@ -1587,6 +1599,7 @@ async fn scenario_fencing(
         lease_id: lease1.lease_id.clone(),
         profile_id: lease1.profile_id.clone(),
         fencing_token: lease1.fencing_token.clone(),
+        expires_at_unix_ms: lease1.expires_at_unix_ms,
     };
     agent
         .install_lease(InstallLeaseRequest {
@@ -1622,6 +1635,7 @@ async fn scenario_fencing(
         lease_id: "ghost-lease".to_string(),
         profile_id: lease1.profile_id.clone(),
         fencing_token: "ghost-token".to_string(),
+        expires_at_unix_ms: 0,
     };
     match agent
         .get_snapshot(GetSnapshotRequest { lease: Some(ghost) })
@@ -1649,6 +1663,7 @@ async fn scenario_fencing(
         lease_id: lease2.lease_id.clone(),
         profile_id: lease2.profile_id.clone(),
         fencing_token: lease2.fencing_token.clone(),
+        expires_at_unix_ms: lease2.expires_at_unix_ms,
     };
     agent
         .install_lease(InstallLeaseRequest {
@@ -1698,6 +1713,7 @@ async fn scenario_fencing_release(
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     };
     let mut agent = connect_agent(&route.agent_grpc_addr).await?;
     agent
@@ -1871,6 +1887,67 @@ async fn scenario_audit(
         entry.machine_id
     );
     println!("SCENARIO audit: PASSED");
+    Ok(())
+}
+
+/// Proves an expired lease is rejected by the agent itself (run the controller
+/// with a long BCP_SWEEP_SECONDS so the only thing rejecting it is the agent's
+/// own expiry check, not the controller's revocation).
+async fn scenario_lease_expiry(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+
+    let acquired = global
+        .acquire_browser(AcquireBrowserRequest {
+            client_id: "lease-expiry-e2e".to_string(),
+            purpose: "verify-expiry".to_string(),
+            platform: entry.platform as i32,
+            account_id: entry.account_id.clone(),
+            label_selector: HashMap::new(),
+            ttl_seconds: 3,
+        })
+        .await?
+        .into_inner();
+    let route = acquired.route.context("no route")?;
+    let lease = acquired.lease.context("no lease")?;
+    let context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(context.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context.clone()),
+        })
+        .await?;
+    println!("lease-expiry: valid lease works");
+
+    // Wait past the 3s TTL. With a long sweep interval the controller has not
+    // revoked it, so only the agent's own expiry check can reject it.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    match agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context),
+        })
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            println!("lease-expiry: PASS expired lease rejected by the agent");
+        }
+        Ok(_) => bail!("lease-expiry: expired lease still worked at the agent"),
+        Err(status) => bail!("lease-expiry: unexpected status: {status}"),
+    }
+    println!("SCENARIO lease-expiry: PASSED");
     Ok(())
 }
 

@@ -434,16 +434,21 @@ fn spawn_telemetry_reporter(service: AgentService) {
                 samples: telemetry.samples.clone(),
                 events: telemetry.events.clone(),
             };
-            let sent = match GlobalControllerClient::connect(controller.clone()).await {
-                Ok(mut client) => match client.report_telemetry(request).await {
+            let connect = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                GlobalControllerClient::connect(controller.clone()),
+            )
+            .await;
+            let sent = match connect {
+                Ok(Ok(mut client)) => match client.report_telemetry(request).await {
                     Ok(_) => true,
                     Err(error) => {
                         tracing::warn!(%error, controller, "telemetry report failed");
                         false
                     }
                 },
-                Err(error) => {
-                    tracing::warn!(%error, controller, "telemetry controller unreachable");
+                _ => {
+                    tracing::warn!(controller, "telemetry controller unreachable");
                     false
                 }
             };
@@ -514,7 +519,12 @@ async fn register_with_controller(
     machine_labels: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let machine_id = service.machine_id();
-    let mut client = GlobalControllerClient::connect(controller.to_string()).await?;
+    let mut client = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        GlobalControllerClient::connect(controller.to_string()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("controller connect timed out"))??;
     client
         .register_machine(RegisterMachineRequest {
             machine: Some(Machine {

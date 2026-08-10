@@ -404,6 +404,7 @@ mod tests {
             lease_id: "lease-1".to_string(),
             profile_id: "profile-1".to_string(),
             fencing_token: "fence-1".to_string(),
+            expires_at_unix_ms: 0,
         }
     }
 

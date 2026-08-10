@@ -314,6 +314,12 @@ impl BrowserFleetManager {
         );
     }
 
+    /// The clock this manager uses, so the machine controller can share it for
+    /// time-based checks (e.g. lease expiry).
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
     /// Restores a telemetry batch that failed to report to the pending buffer so
     /// the next attempt retries it, rather than silently dropping audit events.
     /// The failed (older) batch is kept ahead of newer data and the buffer is

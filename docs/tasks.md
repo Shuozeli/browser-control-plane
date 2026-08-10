@@ -65,7 +65,17 @@
 - [x] Add profile quarantine. `QuarantineProfile` / `ReleaseQuarantine` mark a
       profile quarantined (evicting any active lease) so it is excluded from
       acquire until released.
-- [ ] Add retry policy for controller-to-agent sync.
+- [x] Harden against an adversarial review: agent-side lease expiry
+      (`validate_lease` rejects a lease past its deadline so fencing no longer
+      depends on the revocation RPC landing), TTL clamp + checked math, sweep
+      persistence gating, bounded telemetry (events/metrics caps + retry), lock
+      poison recovery, and connect timeouts on controller<->agent dials.
+- [ ] Controller-owned lease install / agent lease recovery on restart. Today
+      only clients call `install_lease`; if an agent restarts, its in-memory
+      lease map is empty and the profile is stuck `Leased` until TTL. Have the
+      controller install/reconcile leases, or agents re-fetch on startup.
+- [ ] Add retry policy for controller-to-agent sync (partly addressed: dials now
+      time out; still no durable retry/queue for revocation).
 - [ ] Add integration tests with fake machine controllers.
 - [x] Turn Docker multi-network topology skeleton into a runnable e2e suite.
 - [x] Add a real VirtualBox VM fleet test (`tests/vm-fleet`) plus `bcp-e2e`

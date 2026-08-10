@@ -8,7 +8,7 @@ use bcp_core::artifact::{ArtifactError, ArtifactStore, ArtifactStoreConfig};
 use bcp_core::fleet::{BrowserFleetManager, FleetTelemetry};
 use bcp_core::id::UuidIdGenerator;
 use bcp_core::pwright::{PwrightError, PwrightGateway, SharedPwrightGateway};
-use bcp_core::time::SystemClock;
+use bcp_core::time::{Clock, SystemClock};
 use bcp_proto::browsercontrol::v1::machine_controller_server::MachineController;
 use bcp_proto::browsercontrol::v1::upload_artifact_request::Part;
 use bcp_proto::browsercontrol::v1::*;
@@ -23,12 +23,14 @@ pub struct AgentService {
     pwright: SharedPwrightGateway,
     fleet: Arc<BrowserFleetManager>,
     artifacts: Arc<ArtifactStore>,
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Debug, Clone)]
 struct LocalLease {
     profile_id: String,
     fencing_token: String,
+    expires_at_unix_ms: i64,
 }
 
 impl AgentService {
@@ -59,11 +61,13 @@ impl AgentService {
         fleet: Arc<BrowserFleetManager>,
         artifacts: Arc<ArtifactStore>,
     ) -> Self {
+        let clock = fleet.clock();
         Self {
             leases: Arc::new(RwLock::new(HashMap::new())),
             pwright,
             fleet,
             artifacts,
+            clock,
         }
     }
 
@@ -98,7 +102,13 @@ impl AgentService {
             .map_err(Self::artifact_error_to_status)
     }
 
-    pub fn install_lease(&self, lease_id: &str, profile_id: &str, fencing_token: &str) {
+    pub fn install_lease(
+        &self,
+        lease_id: &str,
+        profile_id: &str,
+        fencing_token: &str,
+        expires_at_unix_ms: i64,
+    ) {
         let mut leases = self.leases.write().expect("agent lease lock poisoned");
         // A profile can be leased to at most one client at a time. Installing a
         // new lease for a profile atomically revokes any previously installed
@@ -112,6 +122,7 @@ impl AgentService {
             LocalLease {
                 profile_id: profile_id.to_string(),
                 fencing_token: fencing_token.to_string(),
+                expires_at_unix_ms,
             },
         );
     }
@@ -151,6 +162,12 @@ impl AgentService {
         }
         if local.fencing_token != lease.fencing_token {
             return Err(Status::permission_denied("invalid fencing token"));
+        }
+        // Agent-side expiry: a lease past its deadline is rejected even if the
+        // controller's best-effort revocation never arrived. Fencing no longer
+        // depends on the uninstall RPC landing.
+        if local.expires_at_unix_ms > 0 && self.clock.now_unix_ms() >= local.expires_at_unix_ms {
+            return Err(Status::permission_denied("lease expired"));
         }
         Ok(lease.profile_id)
     }
@@ -196,7 +213,12 @@ impl MachineController for AgentService {
         if lease.fencing_token.is_empty() {
             return Err(Status::invalid_argument("fencing_token is required"));
         }
-        self.install_lease(&lease.lease_id, &lease.profile_id, &lease.fencing_token);
+        self.install_lease(
+            &lease.lease_id,
+            &lease.profile_id,
+            &lease.fencing_token,
+            lease.expires_at_unix_ms,
+        );
         Ok(Response::new(InstallLeaseResponse { installed: true }))
     }
 
@@ -553,6 +575,7 @@ mod tests {
             lease_id: "lease-1".to_string(),
             profile_id: "youtube-main".to_string(),
             fencing_token: "fence-1".to_string(),
+            expires_at_unix_ms: 0,
         }
     }
 
@@ -609,16 +632,19 @@ mod tests {
             lease_id: "lease-old".to_string(),
             profile_id: "youtube-main".to_string(),
             fencing_token: "fence-old".to_string(),
+            expires_at_unix_ms: 0,
         };
         let new_lease = LeaseContext {
             lease_id: "lease-new".to_string(),
             profile_id: "youtube-main".to_string(),
             fencing_token: "fence-new".to_string(),
+            expires_at_unix_ms: 0,
         };
         service.install_lease(
             &old_lease.lease_id,
             &old_lease.profile_id,
             &old_lease.fencing_token,
+            0,
         );
 
         // Act
@@ -626,6 +652,7 @@ mod tests {
             &new_lease.lease_id,
             &new_lease.profile_id,
             &new_lease.fencing_token,
+            0,
         );
 
         // Assert
@@ -641,6 +668,53 @@ mod tests {
             }))
             .await;
         assert!(active.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_lease_rejects_expired_lease() {
+        // Arrange: clock fixed at 10_000.
+        let clock = Arc::new(FakeClock::new(10_000));
+        let gateway = Arc::new(RecordingPwrightGateway::new([RecordingProfileState {
+            profile: profile(),
+            healthy: true,
+            health_message: "ok".to_string(),
+            snapshot: vec![],
+            eval_json: "{}".to_string(),
+        }]));
+        let fleet = Arc::new(BrowserFleetManager::new(
+            "machine-a",
+            gateway.clone(),
+            clock,
+        ));
+        let service = AgentService::with_fleet(gateway, fleet);
+        let context = |lease_id: &str, token: &str, expires: i64| LeaseContext {
+            lease_id: lease_id.to_string(),
+            profile_id: "youtube-main".to_string(),
+            fencing_token: token.to_string(),
+            expires_at_unix_ms: expires,
+        };
+
+        // Act: install a lease already past its deadline, then one in the future.
+        service.install_lease("lease-exp", "youtube-main", "fence-1", 5_000);
+        let expired = service
+            .get_snapshot(Request::new(GetSnapshotRequest {
+                lease: Some(context("lease-exp", "fence-1", 5_000)),
+            }))
+            .await;
+        service.install_lease("lease-live", "youtube-main", "fence-2", 999_999);
+        let live = service
+            .get_snapshot(Request::new(GetSnapshotRequest {
+                lease: Some(context("lease-live", "fence-2", 999_999)),
+            }))
+            .await;
+
+        // Assert
+        assert_eq!(
+            expired.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "an expired lease must be rejected even without a revocation RPC"
+        );
+        assert!(live.is_ok());
     }
 
     #[tokio::test]
@@ -660,7 +734,7 @@ mod tests {
             eval_json: r#"{"title":"ok"}"#.to_string(),
         }]));
         let service = AgentService::new(gateway.clone());
-        service.install_lease("lease-1", "youtube-main", "fence-1");
+        service.install_lease("lease-1", "youtube-main", "fence-1", 0);
 
         // Act
         let response = service

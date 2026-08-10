@@ -20,6 +20,25 @@ const METRIC_BUCKET_MS: i64 = 60_000;
 const DEFAULT_EVENT_LIMIT: usize = 100;
 const DEFAULT_MACHINE_OFFLINE_AFTER_MS: i64 = 60_000;
 const DEFAULT_SWEEP_INTERVAL_SECONDS: u64 = 15;
+/// Upper bound on a lease TTL so `now + ttl * 1000` can never overflow i64 and a
+/// client cannot pin a profile with a near-immortal lease.
+const MAX_LEASE_TTL_SECONDS: i64 = 86_400;
+/// Bounds on in-memory telemetry so a flooding agent cannot exhaust memory/disk.
+const MAX_STORED_EVENTS: usize = 5_000;
+const MAX_STORED_METRICS: usize = 5_000;
+const MAX_EVENT_LIST_LIMIT: usize = 1_000;
+const MAX_EVENT_MESSAGE_LEN: usize = 512;
+
+/// Resolves and clamps a requested lease TTL: non-positive falls back to the
+/// default, and the result is bounded to `[1, MAX_LEASE_TTL_SECONDS]`.
+fn resolve_ttl_seconds(requested: i64) -> i64 {
+    let ttl = if requested > 0 {
+        requested
+    } else {
+        DEFAULT_LEASE_TTL_SECONDS
+    };
+    ttl.clamp(1, MAX_LEASE_TTL_SECONDS)
+}
 
 fn machine_offline_after_ms() -> i64 {
     std::env::var("BCP_MACHINE_OFFLINE_MS")
@@ -132,12 +151,17 @@ impl ControllerService {
             lease_id: lease.lease_id.clone(),
             profile_id: lease.profile_id.clone(),
             fencing_token: lease.fencing_token.clone(),
+            expires_at_unix_ms: lease.expires_at_unix_ms,
         };
         tokio::spawn(async move {
             let Ok(endpoint) = network.endpoint_for_machine(&machine_id).await else {
                 return;
             };
-            let Ok(mut client) = MachineControllerClient::connect(endpoint.agent_grpc_addr).await
+            let Ok(Ok(mut client)) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                MachineControllerClient::connect(endpoint.agent_grpc_addr),
+            )
+            .await
             else {
                 return;
             };
@@ -172,7 +196,10 @@ impl ControllerService {
     /// also revoked at its agent.
     fn sweep_at(&self, now_unix_ms: i64, offline_after_ms: i64) -> Vec<BrowserLease> {
         let revoked = {
-            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next_state = state.clone();
 
             // Mark machines offline once their registration heartbeat goes stale.
@@ -211,9 +238,15 @@ impl ControllerService {
                 }
             }
 
-            let _ = self.persist_state(&next_state);
-            *state = next_state;
-            revoked
+            // Only commit (and revoke at agents) if the new state was durably
+            // persisted; otherwise skip this tick so in-memory and disk cannot
+            // diverge and resurrect reclaimed leases on restart.
+            if self.persist_state(&next_state).is_ok() {
+                *state = next_state;
+                revoked
+            } else {
+                Vec::new()
+            }
         };
         for lease in &revoked {
             self.notify_agent_uninstall(lease);
@@ -223,7 +256,10 @@ impl ControllerService {
 
     pub fn web_snapshot(&self) -> web::ControllerWebSnapshot {
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let expired = Self::mark_expired_leases(&mut next_state, now);
         if expired && self.persist_state(&next_state).is_ok() {
@@ -382,16 +418,22 @@ impl ControllerService {
             profile.status = ProfileStatus::Available as i32;
         }
         // Operator/controller-owned statuses must survive an agent heartbeat: an
-        // agent re-registers reporting `Available`, but a Quarantined or Broken
-        // profile stays out of service until the controller clears it.
-        if let Some(existing) = state.profiles.get(&profile.profile_id) {
-            let operator_owned = existing.status == ProfileStatus::Quarantined as i32
-                || existing.status == ProfileStatus::Broken as i32;
-            if operator_owned {
-                profile.status = existing.status;
+        // agent re-registers reporting `Available`, but a Quarantined, Broken, or
+        // Launching profile keeps that status until the controller clears it. The
+        // active-lease override only applies when the status is NOT operator-owned.
+        let existing_status = state
+            .profiles
+            .get(&profile.profile_id)
+            .map(|existing| existing.status);
+        let operator_owned = matches!(
+            existing_status.and_then(|status| ProfileStatus::try_from(status).ok()),
+            Some(ProfileStatus::Quarantined | ProfileStatus::Broken | ProfileStatus::Launching)
+        );
+        if operator_owned {
+            if let Some(status) = existing_status {
+                profile.status = status;
             }
-        }
-        if Self::active_lease_for_profile(state, &profile.profile_id).is_some() {
+        } else if Self::active_lease_for_profile(state, &profile.profile_id).is_some() {
             profile.status = ProfileStatus::Leased as i32;
         }
         if profile.last_seen_unix_ms == 0 {
@@ -640,7 +682,10 @@ impl GlobalController for ControllerService {
             machine.status = MachineStatus::Online as i32;
         }
 
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         Self::mark_expired_leases(&mut next_state, now);
         next_state
@@ -668,7 +713,10 @@ impl GlobalController for ControllerService {
             return Err(Status::invalid_argument("machine_id is required"));
         }
 
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.clock.now_unix_ms();
         let mut next_state = state.clone();
         Self::mark_expired_leases(&mut next_state, now);
@@ -700,7 +748,10 @@ impl GlobalController for ControllerService {
         request: Request<ListMachinesRequest>,
     ) -> Result<Response<ListMachinesResponse>, Status> {
         let request = request.into_inner();
-        let state = self.state.read().expect("controller state lock poisoned");
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let machines = state
             .machines
             .values()
@@ -716,7 +767,10 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<ListProfilesResponse>, Status> {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let expired = Self::mark_expired_leases(&mut next_state, now);
         if expired {
@@ -746,7 +800,10 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<ListBrowserAccountBindingsResponse>, Status> {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let expired = Self::mark_expired_leases(&mut next_state, now);
         if expired {
@@ -775,7 +832,10 @@ impl GlobalController for ControllerService {
             ));
         }
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let expired = Self::mark_expired_leases(&mut next_state, now);
         if expired {
@@ -827,18 +887,17 @@ impl GlobalController for ControllerService {
         }
         let now = self.clock.now_unix_ms();
         let selected_profile = {
-            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next_state = state.clone();
             Self::mark_expired_leases(&mut next_state, now);
             let profile = Self::select_profile_for_acquire(&next_state, &request)
                 .ok_or_else(|| Status::not_found("no available profile matched request"))?;
             let lease_id = self.ids.next_id("lease");
             let fencing_token = self.ids.next_id("fence");
-            let ttl_seconds = if request.ttl_seconds > 0 {
-                request.ttl_seconds
-            } else {
-                DEFAULT_LEASE_TTL_SECONDS
-            };
+            let ttl_seconds = resolve_ttl_seconds(request.ttl_seconds);
             let lease = BrowserLease {
                 lease_id: lease_id.clone(),
                 profile_id: profile.profile_id.clone(),
@@ -881,13 +940,12 @@ impl GlobalController for ControllerService {
         request: Request<RenewLeaseRequest>,
     ) -> Result<Response<RenewLeaseResponse>, Status> {
         let request = request.into_inner();
-        let ttl_seconds = if request.ttl_seconds > 0 {
-            request.ttl_seconds
-        } else {
-            DEFAULT_LEASE_TTL_SECONDS
-        };
+        let ttl_seconds = resolve_ttl_seconds(request.ttl_seconds);
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         Self::mark_expired_leases(&mut next_state, now);
         let lease = next_state
@@ -910,7 +968,10 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<ReleaseLeaseResponse>, Status> {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         Self::mark_expired_leases(&mut next_state, now);
         let lease = next_state
@@ -943,7 +1004,10 @@ impl GlobalController for ControllerService {
         }
         let now = self.clock.now_unix_ms();
         let (profile, evicted) = {
-            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next_state = state.clone();
             Self::mark_expired_leases(&mut next_state, now);
             let profile = {
@@ -984,7 +1048,10 @@ impl GlobalController for ControllerService {
         if request.profile_id.is_empty() {
             return Err(Status::invalid_argument("profile_id is required"));
         }
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let profile = {
             let profile = next_state
@@ -1010,7 +1077,10 @@ impl GlobalController for ControllerService {
         let request = request.into_inner();
         let lease = {
             let now = self.clock.now_unix_ms();
-            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut next_state = state.clone();
             let expired = Self::mark_expired_leases(&mut next_state, now);
             let lease = next_state
@@ -1052,7 +1122,10 @@ impl GlobalController for ControllerService {
             return Err(Status::invalid_argument("reporter_machine_id is required"));
         }
 
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let mut accepted_samples = 0;
         for mut sample in request.samples {
@@ -1076,10 +1149,30 @@ impl GlobalController for ControllerService {
             accepted_samples += 1;
         }
 
+        // Bound the metric map: evict the oldest buckets once past the cap so a
+        // flooding/high-cardinality reporter cannot grow it without limit.
+        if next_state.metrics.len() > MAX_STORED_METRICS {
+            let mut buckets: Vec<(i64, MetricBucketKey)> = next_state
+                .metrics
+                .keys()
+                .map(|key| (key.bucket_start_unix_ms, key.clone()))
+                .collect();
+            buckets.sort_by_key(|(start, _)| *start);
+            let excess = next_state.metrics.len() - MAX_STORED_METRICS;
+            for (_, key) in buckets.into_iter().take(excess) {
+                next_state.metrics.remove(&key);
+            }
+        }
+
         let accepted_events = request.events.len() as i32;
         next_state
             .events
             .extend(request.events.into_iter().map(redact_event));
+        // Bound the stored event log to the newest events.
+        if next_state.events.len() > MAX_STORED_EVENTS {
+            let excess = next_state.events.len() - MAX_STORED_EVENTS;
+            next_state.events.drain(0..excess);
+        }
         self.persist_state(&next_state)?;
         *state = next_state;
         Ok(Response::new(ReportTelemetryResponse {
@@ -1094,7 +1187,10 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<GetMetricSummaryResponse>, Status> {
         let request = request.into_inner();
         let domain = sanitize_domain(&request.domain);
-        let state = self.state.read().expect("controller state lock poisoned");
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let points = state
             .metrics
             .values()
@@ -1121,11 +1217,14 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<ListControlPlaneEventsResponse>, Status> {
         let request = request.into_inner();
         let limit = if request.limit > 0 {
-            request.limit as usize
+            (request.limit as usize).min(MAX_EVENT_LIST_LIMIT)
         } else {
             DEFAULT_EVENT_LIMIT
         };
-        let state = self.state.read().expect("controller state lock poisoned");
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut events: Vec<ControlPlaneEvent> = state
             .events
             .iter()
@@ -1151,7 +1250,10 @@ impl GlobalController for ControllerService {
         if request.reporter_machine_id.is_empty() {
             return Err(Status::invalid_argument("reporter_machine_id is required"));
         }
-        let mut state = self.state.write().expect("controller state lock poisoned");
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next_state = state.clone();
         let mut accepted_artifacts = 0;
         for mut artifact in request.artifacts {
@@ -1179,7 +1281,10 @@ impl GlobalController for ControllerService {
     ) -> Result<Response<ListArtifactsResponse>, Status> {
         let request = request.into_inner();
         let now = self.clock.now_unix_ms();
-        let state = self.state.read().expect("controller state lock poisoned");
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut artifacts: Vec<Artifact> = state
             .artifacts
             .values()
@@ -1227,6 +1332,16 @@ fn sanitize_domain(value: &str) -> String {
 }
 
 fn redact_event(mut event: ControlPlaneEvent) -> ControlPlaneEvent {
+    // Bound the message so a misbehaving agent cannot leak large payloads or
+    // bloat storage through the free-form message field. Truncate on a UTF-8
+    // char boundary so this can never panic.
+    if event.message.len() > MAX_EVENT_MESSAGE_LEN {
+        let mut end = MAX_EVENT_MESSAGE_LEN;
+        while end > 0 && !event.message.is_char_boundary(end) {
+            end -= 1;
+        }
+        event.message.truncate(end);
+    }
     event.attributes.remove("url");
     event.attributes.remove("full_url");
     event.attributes.remove("html");
@@ -1615,6 +1730,53 @@ mod tests {
             .find(|machine| machine.machine_id == "m1")
             .unwrap();
         assert_eq!(machine.status, MachineStatus::Offline as i32);
+    }
+
+    #[tokio::test]
+    async fn acquire_clamps_excessive_ttl_without_overflow() {
+        // Arrange
+        let service = test_service();
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(Machine {
+                    machine_id: "m1".to_string(),
+                    status: MachineStatus::Online as i32,
+                    ..Default::default()
+                }),
+                profiles: vec![BrowserProfile {
+                    profile_id: "p1".to_string(),
+                    machine_id: "m1".to_string(),
+                    status: ProfileStatus::Available as i32,
+                    accounts: vec![Account {
+                        account_id: "acct".to_string(),
+                        platform: AccountPlatform::Youtube as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .unwrap();
+
+        // Act: a huge TTL would overflow `now + ttl * 1000` without clamping.
+        let acquired = service
+            .acquire_browser(Request::new(AcquireBrowserRequest {
+                client_id: "c".to_string(),
+                platform: AccountPlatform::Youtube as i32,
+                account_id: "acct".to_string(),
+                ttl_seconds: i64::MAX,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Assert: no panic, and expiry is clamped to the max TTL from `now` (1000).
+        let lease = acquired.lease.unwrap();
+        assert_eq!(
+            lease.expires_at_unix_ms,
+            1_000 + MAX_LEASE_TTL_SECONDS * 1000
+        );
     }
 
     #[tokio::test]

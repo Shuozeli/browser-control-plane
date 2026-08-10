@@ -404,6 +404,9 @@ message LeaseContext {
   string lease_id = 1;
   string profile_id = 2;
   string fencing_token = 3;
+  // Absolute lease expiry; the machine controller rejects an installed lease
+  // past this time so agent-side fencing does not depend on a revocation RPC.
+  int64 expires_at_unix_ms = 4;
 }
 
 message InstallLeaseRequest {

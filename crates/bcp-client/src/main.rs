@@ -391,6 +391,7 @@ fn lease_context(lease: &BrowserLease) -> LeaseContext {
         lease_id: lease.lease_id.clone(),
         profile_id: lease.profile_id.clone(),
         fencing_token: lease.fencing_token.clone(),
+        expires_at_unix_ms: lease.expires_at_unix_ms,
     }
 }
 
