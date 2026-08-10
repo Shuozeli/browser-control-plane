@@ -1509,6 +1509,8 @@ async fn scenarios_main() -> anyhow::Result<()> {
     match scenario.as_str() {
         "exclusivity" => scenario_exclusivity(&mut global).await,
         "fencing" => scenario_fencing(&mut global).await,
+        "fencing-release" => scenario_fencing_release(&mut global).await,
+        "auto-offline" => scenario_auto_offline(&mut global).await,
         "failover" => scenario_failover(&mut global).await,
         "persistence-acquire" => scenario_persistence_acquire(&mut global).await,
         "persistence-verify" => scenario_persistence_verify(&mut global).await,
@@ -1673,6 +1675,100 @@ async fn scenario_fencing(
         Err(status) => println!("fencing: superseded lease errored unexpectedly: {status}"),
     }
     println!("SCENARIO fencing: DONE (A+B pass; C is a documented finding)");
+    Ok(())
+}
+
+/// Proves the controller revokes a lease at its agent on release even when no
+/// successor re-leases the profile (the residual the local-eviction fix left).
+async fn scenario_fencing_release(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let entry = &fleet[0];
+
+    let acquired = raw_acquire(global, entry)
+        .await
+        .map_err(|status| anyhow::anyhow!("acquire failed: {status}"))?;
+    let route = acquired.route.context("no route")?;
+    let lease = acquired.lease.context("no lease")?;
+    let context = LeaseContext {
+        lease_id: lease.lease_id.clone(),
+        profile_id: lease.profile_id.clone(),
+        fencing_token: lease.fencing_token.clone(),
+    };
+    let mut agent = connect_agent(&route.agent_grpc_addr).await?;
+    agent
+        .install_lease(InstallLeaseRequest {
+            lease: Some(context.clone()),
+        })
+        .await?;
+    agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context.clone()),
+        })
+        .await?;
+    println!("fencing-release: valid lease works");
+
+    global
+        .release_lease(ReleaseLeaseRequest {
+            lease_id: lease.lease_id.clone(),
+            fencing_token: lease.fencing_token.clone(),
+        })
+        .await?;
+    // The controller revokes the lease at the agent asynchronously.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    match agent
+        .get_snapshot(GetSnapshotRequest {
+            lease: Some(context),
+        })
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            println!("fencing-release: PASS released lease revoked at agent (no successor needed)");
+        }
+        Ok(_) => bail!("fencing-release: released lease is still valid at the agent"),
+        Err(status) => bail!("fencing-release: unexpected status: {status}"),
+    }
+    println!("SCENARIO fencing-release: PASSED");
+    Ok(())
+}
+
+/// Proves the controller's background sweep marks machines offline once their
+/// registration heartbeat goes stale. Run the controller with a low
+/// `BCP_MACHINE_OFFLINE_MS` and `BCP_SWEEP_SECONDS`.
+async fn scenario_auto_offline(
+    global: &mut GlobalControllerClient<tonic::transport::Channel>,
+) -> anyhow::Result<()> {
+    let fleet = fleet_from_env()?;
+    register_fleet(global, &fleet).await?;
+    let wait_ms: u64 = std::env::var("BCP_OFFLINE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(6000);
+    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+
+    let machines = global
+        .list_machines(ListMachinesRequest {
+            label_selector: HashMap::new(),
+        })
+        .await?
+        .into_inner();
+    let offline = machines
+        .machines
+        .iter()
+        .filter(|machine| machine.status == MachineStatus::Offline as i32)
+        .count();
+    if offline < fleet.len() {
+        bail!(
+            "expected all {} stale machines offline, got {}",
+            fleet.len(),
+            offline
+        );
+    }
+    println!("auto-offline: PASS the sweep marked {offline} stale machine(s) offline");
+    println!("SCENARIO auto-offline: PASSED");
     Ok(())
 }
 

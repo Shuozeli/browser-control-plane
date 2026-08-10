@@ -6,6 +6,7 @@ use bcp_core::id::{IdGenerator, UuidIdGenerator};
 use bcp_core::network::{NetworkDirectory, StaticNetworkDirectory};
 use bcp_core::time::{Clock, SystemClock};
 use bcp_proto::browsercontrol::v1::global_controller_server::GlobalController;
+use bcp_proto::browsercontrol::v1::machine_controller_client::MachineControllerClient;
 use bcp_proto::browsercontrol::v1::*;
 use prost::Message;
 use rusqlite::{Connection, params};
@@ -17,6 +18,24 @@ const DEFAULT_LEASE_TTL_SECONDS: i64 = 300;
 const DEFAULT_HEARTBEAT_AFTER_SECONDS: i32 = 10;
 const METRIC_BUCKET_MS: i64 = 60_000;
 const DEFAULT_EVENT_LIMIT: usize = 100;
+const DEFAULT_MACHINE_OFFLINE_AFTER_MS: i64 = 60_000;
+const DEFAULT_SWEEP_INTERVAL_SECONDS: u64 = 15;
+
+fn machine_offline_after_ms() -> i64 {
+    std::env::var("BCP_MACHINE_OFFLINE_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MACHINE_OFFLINE_AFTER_MS)
+}
+
+fn sweep_interval_seconds() -> u64 {
+    std::env::var("BCP_SWEEP_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SWEEP_INTERVAL_SECONDS)
+        .max(1)
+}
 
 #[derive(Clone)]
 pub struct ControllerService {
@@ -101,6 +120,90 @@ impl ControllerService {
             network,
             store: Some(Arc::new(Mutex::new(conn))),
         })
+    }
+
+    /// Best-effort revocation of a lease at its owning machine controller, so a
+    /// released or expired lease can no longer pass the agent's fencing check
+    /// even when no successor re-leases the profile.
+    fn notify_agent_uninstall(&self, lease: &BrowserLease) {
+        let network = self.network.clone();
+        let machine_id = lease.machine_id.clone();
+        let context = LeaseContext {
+            lease_id: lease.lease_id.clone(),
+            profile_id: lease.profile_id.clone(),
+            fencing_token: lease.fencing_token.clone(),
+        };
+        tokio::spawn(async move {
+            let Ok(endpoint) = network.endpoint_for_machine(&machine_id).await else {
+                return;
+            };
+            let Ok(mut client) = MachineControllerClient::connect(endpoint.agent_grpc_addr).await
+            else {
+                return;
+            };
+            let _ = client
+                .uninstall_lease(UninstallLeaseRequest {
+                    lease: Some(context),
+                })
+                .await;
+        });
+    }
+
+    /// Spawns the background reliability sweep: expires leases (revoking them at
+    /// their agents) and marks machines offline once their heartbeat goes stale.
+    pub fn spawn_sweep(&self) {
+        let service = self.clone();
+        let interval = sweep_interval_seconds();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+            loop {
+                ticker.tick().await;
+                service.sweep_once();
+            }
+        });
+    }
+
+    fn sweep_once(&self) {
+        self.sweep_at(self.clock.now_unix_ms(), machine_offline_after_ms());
+    }
+
+    /// Runs one reliability pass at a given time with a given offline threshold.
+    /// Returns the leases that expired so callers/tests can observe them; each is
+    /// also revoked at its agent.
+    fn sweep_at(&self, now_unix_ms: i64, offline_after_ms: i64) -> Vec<BrowserLease> {
+        let expired = {
+            let mut state = self.state.write().expect("controller state lock poisoned");
+            let mut next_state = state.clone();
+            let expired: Vec<BrowserLease> = next_state
+                .leases
+                .values()
+                .filter(|lease| lease.expires_at_unix_ms <= now_unix_ms)
+                .cloned()
+                .collect();
+            for lease in &expired {
+                next_state.leases.remove(&lease.lease_id);
+                if let Some(profile) = next_state.profiles.get_mut(&lease.profile_id)
+                    && profile.status == ProfileStatus::Leased as i32
+                {
+                    profile.status = ProfileStatus::Available as i32;
+                }
+            }
+            for machine in next_state.machines.values_mut() {
+                if machine.status == MachineStatus::Online as i32
+                    && machine.last_heartbeat_unix_ms > 0
+                    && now_unix_ms - machine.last_heartbeat_unix_ms > offline_after_ms
+                {
+                    machine.status = MachineStatus::Offline as i32;
+                }
+            }
+            let _ = self.persist_state(&next_state);
+            *state = next_state;
+            expired
+        };
+        for lease in &expired {
+            self.notify_agent_uninstall(lease);
+        }
+        expired
     }
 
     pub fn web_snapshot(&self) -> web::ControllerWebSnapshot {
@@ -792,6 +895,7 @@ impl GlobalController for ControllerService {
         if lease.fencing_token != request.fencing_token {
             return Err(Status::permission_denied("invalid fencing token"));
         }
+        let released_lease = lease.clone();
         let profile_id = lease.profile_id.clone();
         next_state.leases.remove(&request.lease_id);
         if let Some(profile) = next_state.profiles.get_mut(&profile_id) {
@@ -799,6 +903,8 @@ impl GlobalController for ControllerService {
         }
         self.persist_state(&next_state)?;
         *state = next_state;
+        drop(state);
+        self.notify_agent_uninstall(&released_lease);
         Ok(Response::new(ReleaseLeaseResponse { released: true }))
     }
 
@@ -1379,6 +1485,41 @@ mod tests {
             Arc::new(StaticNetworkDirectory::default()),
         );
         (service, clock)
+    }
+
+    #[tokio::test]
+    async fn sweep_marks_stale_online_machine_offline() {
+        // Arrange
+        let service = test_service();
+        service
+            .register_machine(Request::new(RegisterMachineRequest {
+                machine: Some(Machine {
+                    machine_id: "m1".to_string(),
+                    status: MachineStatus::Online as i32,
+                    ..Default::default()
+                }),
+                profiles: vec![],
+            }))
+            .await
+            .unwrap();
+
+        // Act: sweep far past the machine's registration heartbeat.
+        service.sweep_at(5_000_000, 60_000);
+
+        // Assert
+        let machines = service
+            .list_machines(Request::new(ListMachinesRequest {
+                label_selector: HashMap::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let machine = machines
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == "m1")
+            .unwrap();
+        assert_eq!(machine.status, MachineStatus::Offline as i32);
     }
 
     fn sqlite_test_service(path: &std::path::Path) -> ControllerService {

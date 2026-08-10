@@ -49,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(StaticNetworkDirectory::default()),
     )?;
 
+    service.spawn_sweep();
+
     let grpc = tonic::transport::Server::builder()
         .add_service(GlobalControllerServer::new(service.clone()))
         .serve(addr);

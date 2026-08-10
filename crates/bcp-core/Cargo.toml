@@ -10,7 +10,9 @@ async-trait.workspace = true
 bcp-proto.workspace = true
 pwright-bridge = { workspace = true, optional = true }
 rusqlite.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true

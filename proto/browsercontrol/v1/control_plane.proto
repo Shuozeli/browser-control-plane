@@ -29,6 +29,7 @@ service GlobalController {
 // this local proxy after the global controller grants a lease and route.
 service MachineController {
   rpc InstallLease(InstallLeaseRequest) returns (InstallLeaseResponse);
+  rpc UninstallLease(UninstallLeaseRequest) returns (UninstallLeaseResponse);
   rpc ListLocalProfiles(ListLocalProfilesRequest) returns (ListLocalProfilesResponse);
   rpc EnsureBrowser(EnsureBrowserRequest) returns (EnsureBrowserResponse);
   rpc StopBrowser(StopBrowserRequest) returns (StopBrowserResponse);
@@ -391,6 +392,14 @@ message InstallLeaseRequest {
 
 message InstallLeaseResponse {
   bool installed = 1;
+}
+
+message UninstallLeaseRequest {
+  LeaseContext lease = 1;
+}
+
+message UninstallLeaseResponse {
+  bool uninstalled = 1;
 }
 
 message ListLocalProfilesRequest {}

@@ -468,13 +468,141 @@ impl PwrightGateway for RealPwrightGateway {
     async fn run_script(
         &self,
         profile_id: &str,
-        _yaml: &str,
-        _params: HashMap<String, String>,
+        yaml: &str,
+        params: HashMap<String, String>,
     ) -> Result<Vec<RunScriptResponse>, PwrightError> {
-        self.ensure_browser(profile_id).await?;
-        Ok(vec![RunScriptResponse {
-            json_line: r#"{"event":"script_complete","source":"real_pwright_gateway"}"#.to_string(),
-        }])
+        let page = self.page_for_profile(profile_id).await?;
+        let mut source = yaml.to_string();
+        for (key, value) in &params {
+            source = source.replace(&format!("${{{key}}}"), value);
+        }
+        let script: ScriptSpec = serde_yaml::from_str(&source)
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+
+        let mut lines = Vec::new();
+        for (index, step) in script.steps.iter().enumerate() {
+            match run_script_step(&page, step).await {
+                Ok(result) => lines.push(RunScriptResponse {
+                    json_line: serde_json::json!({
+                        "step": index,
+                        "action": step.action,
+                        "ok": true,
+                        "result": result,
+                    })
+                    .to_string(),
+                }),
+                Err(error) => {
+                    lines.push(RunScriptResponse {
+                        json_line: serde_json::json!({
+                            "step": index,
+                            "action": step.action,
+                            "ok": false,
+                            "error": error.to_string(),
+                        })
+                        .to_string(),
+                    });
+                    // Stop at the first failing step so callers see where it broke.
+                    return Ok(lines);
+                }
+            }
+        }
+        lines.push(RunScriptResponse {
+            json_line: serde_json::json!({
+                "event": "script_complete",
+                "steps": script.steps.len(),
+            })
+            .to_string(),
+        });
+        Ok(lines)
+    }
+}
+
+/// A `RunScript` program: an ordered list of steps executed against the page.
+#[cfg(feature = "real-pwright")]
+#[derive(Debug, serde::Deserialize)]
+struct ScriptSpec {
+    #[serde(default)]
+    steps: Vec<ScriptStep>,
+}
+
+#[cfg(feature = "real-pwright")]
+#[derive(Debug, serde::Deserialize)]
+struct ScriptStep {
+    action: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    selector: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    expression: String,
+    #[serde(default)]
+    ms: u64,
+}
+
+#[cfg(feature = "real-pwright")]
+async fn run_script_step(
+    page: &Page,
+    step: &ScriptStep,
+) -> Result<serde_json::Value, PwrightError> {
+    let fail = |error: Box<dyn std::fmt::Display>| {
+        PwrightError::OperationFailed("script".to_string(), error.to_string())
+    };
+    match step.action.as_str() {
+        "goto" => {
+            page.goto(
+                &step.url,
+                Some(pwright_bridge::playwright::GotoOptions {
+                    wait_until: pwright_bridge::navigate::WaitStrategy::Dom,
+                    timeout_ms: Some(30_000),
+                }),
+            )
+            .await
+            .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!(step.url))
+        }
+        "click" => {
+            page.click(&step.selector)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("clicked"))
+        }
+        "fill" => {
+            page.fill(&step.selector, &step.text)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("filled"))
+        }
+        "type" => {
+            page.type_text(&step.selector, &step.text)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("typed"))
+        }
+        "press" => {
+            page.press(&step.selector, &step.key)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("pressed"))
+        }
+        "wait_ms" => {
+            tokio::time::sleep(std::time::Duration::from_millis(step.ms)).await;
+            Ok(serde_json::json!(step.ms))
+        }
+        "eval" => {
+            let value = page
+                .evaluate(&step.expression)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(value.get("value").cloned().unwrap_or(value))
+        }
+        other => Err(PwrightError::OperationFailed(
+            "script".to_string(),
+            format!("unknown step action: {other}"),
+        )),
     }
 }
 

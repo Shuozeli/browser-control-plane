@@ -112,6 +112,20 @@ impl AgentService {
         );
     }
 
+    /// Removes an installed lease. The controller calls this on lease release or
+    /// expiry so a stale holder can no longer pass lease validation. The fencing
+    /// token must match, so a revoked client cannot evict its successor.
+    pub fn uninstall_lease(&self, lease_id: &str, fencing_token: &str) -> bool {
+        let mut leases = self.leases.write().expect("agent lease lock poisoned");
+        match leases.get(lease_id) {
+            Some(lease) if lease.fencing_token == fencing_token => {
+                leases.remove(lease_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     fn validate_lease(&self, lease: Option<LeaseContext>) -> Result<String, Status> {
         let lease = lease.ok_or_else(|| Status::invalid_argument("lease is required"))?;
@@ -180,6 +194,21 @@ impl MachineController for AgentService {
         }
         self.install_lease(&lease.lease_id, &lease.profile_id, &lease.fencing_token);
         Ok(Response::new(InstallLeaseResponse { installed: true }))
+    }
+
+    async fn uninstall_lease(
+        &self,
+        request: Request<UninstallLeaseRequest>,
+    ) -> Result<Response<UninstallLeaseResponse>, Status> {
+        let lease = request
+            .into_inner()
+            .lease
+            .ok_or_else(|| Status::invalid_argument("lease is required"))?;
+        if lease.lease_id.is_empty() {
+            return Err(Status::invalid_argument("lease_id is required"));
+        }
+        let uninstalled = self.uninstall_lease(&lease.lease_id, &lease.fencing_token);
+        Ok(Response::new(UninstallLeaseResponse { uninstalled }))
     }
 
     async fn list_local_profiles(

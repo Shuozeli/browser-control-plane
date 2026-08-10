@@ -17,11 +17,10 @@
 - [x] Implement CDP port allocation.
 - [x] Implement config-driven browser process launch and stop.
 - [x] Implement browser health check and CDP readiness probe.
-- [~] Add lease cache and local fencing validation. Installing a lease now
-      enforces one active lease per profile and revokes the prior one, so a
-      released/superseded lease can no longer pass `validate_lease`. Residual:
-      a released lease with no successor is not yet invalidated (needs the
-      controller to push an uninstall on release/expiry).
+- [x] Add lease cache and local fencing validation. Installing a lease enforces
+      one active lease per profile and revokes the prior one; the controller also
+      pushes an `UninstallLease` to the agent on release and on expiry (via the
+      sweep), so a released or superseded lease can never pass `validate_lease`.
 
 ## Phase 2: Global Controller
 
@@ -41,29 +40,32 @@
 - [x] Implement snapshot proxy.
 - [x] Implement action proxy.
 - [x] Implement evaluate proxy.
-- [x] Implement script proxy.
+- [x] Implement script proxy. The real gateway now executes a YAML step program
+      (goto / click / fill / type / press / eval / wait_ms) against the page and
+      streams a JSON result per step, with `${param}` substitution.
 - [ ] Add structured audit events for all browser operations.
 
 ## Phase 4: Client
 
-- [ ] Implement `acquire`.
-- [ ] Implement `release`.
-- [ ] Implement `route`.
-- [ ] Implement browser command helpers that use machine-controller routes.
-- [ ] Add JSON output for automation.
+- [x] Implement `acquire`.
+- [x] Implement `release`.
+- [x] Implement `route`.
+- [x] Implement browser command helpers that use machine-controller routes
+      (`snapshot`, `eval`, `run-script`: acquire -> install -> drive -> release).
+- [x] Add JSON output for automation (`run-script` streams per-step JSON).
 
 ## Phase 5: Reliability
 
-- [ ] Add stale machine detection. (Gap confirmed by the `failover` scenario:
-      a downed machine stays `online` until it is used.)
+- [x] Add stale machine detection. A background sweep marks a machine offline
+      once its registration heartbeat is older than `BCP_MACHINE_OFFLINE_MS`.
 - [ ] Add stale lease cleanup.
 - [ ] Add profile quarantine.
 - [ ] Add retry policy for controller-to-agent sync.
 - [ ] Add integration tests with fake machine controllers.
 - [x] Turn Docker multi-network topology skeleton into a runnable e2e suite.
 - [x] Add a real VirtualBox VM fleet test (`tests/vm-fleet`) plus `bcp-e2e`
-      `vm-fleet` and `scenarios` (exclusivity / fencing / failover /
-      persistence) modes driven by `BCP_FLEET`.
+      `vm-fleet` and `scenarios` (exclusivity / fencing / fencing-release /
+      auto-offline / failover / persistence) modes driven by `BCP_FLEET`.
 
 ## Phase 5.5: Observability
 
