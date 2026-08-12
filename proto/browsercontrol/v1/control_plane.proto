@@ -46,8 +46,15 @@ service MachineController {
   rpc ExecuteAction(ExecuteActionRequest) returns (ExecuteActionResponse);
   rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
   rpc RunScript(RunScriptRequest) returns (stream RunScriptResponse);
+  rpc CaptureScreenshot(CaptureScreenshotRequest) returns (CaptureScreenshotResponse);
+  rpc PrintPdf(PrintPdfRequest) returns (PrintPdfResponse);
+  rpc GetCookies(GetCookiesRequest) returns (GetCookiesResponse);
+  rpc SetCookies(SetCookiesRequest) returns (SetCookiesResponse);
+  rpc GetPage(GetPageRequest) returns (GetPageResponse);
+  rpc SetInputFiles(SetInputFilesRequest) returns (SetInputFilesResponse);
 
   rpc UploadArtifact(stream UploadArtifactRequest) returns (UploadArtifactResponse);
+  rpc DownloadArtifact(DownloadArtifactRequest) returns (stream DownloadArtifactResponse);
   rpc ListLocalArtifacts(ListLocalArtifactsRequest) returns (ListLocalArtifactsResponse);
   rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
 }
@@ -517,6 +524,72 @@ message RunScriptResponse {
   string json_line = 1;
 }
 
+message CaptureScreenshotRequest {
+  LeaseContext lease = 1;
+  // "png" (default), "jpeg", or "webp".
+  string format = 2;
+  // Capture the full scrollable page instead of just the viewport.
+  bool full_page = 3;
+}
+
+message CaptureScreenshotResponse {
+  // Base64-encoded image bytes (as returned by CDP Page.captureScreenshot).
+  string base64_data = 1;
+  string format = 2;
+}
+
+message PrintPdfRequest {
+  LeaseContext lease = 1;
+}
+
+message PrintPdfResponse {
+  // Base64-encoded PDF bytes (as returned by CDP Page.printToPDF).
+  string base64_data = 1;
+}
+
+message GetCookiesRequest {
+  LeaseContext lease = 1;
+}
+
+message GetCookiesResponse {
+  // JSON array of cookies. Over the semantic gateway this carries name/value
+  // only; httpOnly cookies require the raw CDP proxy (Network.getCookies).
+  string cookies_json = 1;
+}
+
+message SetCookiesRequest {
+  LeaseContext lease = 1;
+  // JSON array of cookies; each needs at least {name, value}. Optional: path.
+  string cookies_json = 2;
+}
+
+message SetCookiesResponse {
+  uint32 count = 1;
+}
+
+message GetPageRequest {
+  LeaseContext lease = 1;
+}
+
+message GetPageResponse {
+  string url = 1;
+  string title = 2;
+  // Full serialized HTML of the current document.
+  string content = 3;
+}
+
+message SetInputFilesRequest {
+  LeaseContext lease = 1;
+  // CSS selector for the <input type=file> element.
+  string selector = 2;
+  // Machine-local paths (e.g. an artifact stored via UploadArtifact).
+  repeated string files = 3;
+}
+
+message SetInputFilesResponse {
+  bool ok = 1;
+}
+
 message UploadArtifactMetadata {
   LeaseContext lease = 1;
   string original_filename = 2;
@@ -534,6 +607,25 @@ message UploadArtifactRequest {
 
 message UploadArtifactResponse {
   Artifact artifact = 1;
+}
+
+message DownloadArtifactRequest {
+  LeaseContext lease = 1;
+  string artifact_id = 2;
+}
+
+message ArtifactDownloadMetadata {
+  string artifact_id = 1;
+  string original_filename = 2;
+  string content_type = 3;
+  int64 size_bytes = 4;
+}
+
+message DownloadArtifactResponse {
+  oneof part {
+    ArtifactDownloadMetadata metadata = 1;
+    bytes chunk = 2;
+  }
 }
 
 message ListLocalArtifactsRequest {

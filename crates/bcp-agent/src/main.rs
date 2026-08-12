@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_controller_registration(service.clone(), addr, runtime.machine_labels);
     spawn_telemetry_reporter(service.clone());
     spawn_lease_sync(service.clone());
+    spawn_cdp_proxy(service.clone(), addr);
 
     tonic::transport::Server::builder()
         .add_service(MachineControllerServer::new(service))
@@ -73,6 +74,42 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Start the raw CDP transparent proxy on a sibling port (gRPC port + 1 by
+/// default, or `BCP_AGENT_PROXY_ADDR`). It re-exposes each profile's
+/// localhost-bound Chrome, lease-gated, over the Tailscale interface.
+fn spawn_cdp_proxy(service: AgentService, grpc_addr: SocketAddr) {
+    let bind_addr: SocketAddr = match std::env::var("BCP_AGENT_PROXY_ADDR") {
+        Ok(value) => match value.parse() {
+            Ok(addr) => addr,
+            Err(error) => {
+                tracing::warn!(%value, %error, "invalid BCP_AGENT_PROXY_ADDR; cdp proxy disabled");
+                return;
+            }
+        },
+        Err(_) => SocketAddr::new(grpc_addr.ip(), grpc_addr.port() + 1),
+    };
+    // External clients reach the proxy via the advertised host (MagicDNS when
+    // set), so rewritten ws URLs are dialable from off-box.
+    let public_host = match std::env::var("TAILSCALE_HOST") {
+        Ok(host) if !host.is_empty() => format!("{}:{}", host.trim_end_matches('.'), bind_addr.port()),
+        _ => bind_addr.to_string(),
+    };
+    tokio::spawn(async move {
+        let router = bcp_agent::proxy::router(service, public_host);
+        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::warn!(%bind_addr, %error, "cdp proxy failed to bind");
+                return;
+            }
+        };
+        tracing::info!(%bind_addr, "raw CDP proxy listening");
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::warn!(%error, "cdp proxy server exited");
+        }
+    });
 }
 
 fn default_addr() -> SocketAddr {

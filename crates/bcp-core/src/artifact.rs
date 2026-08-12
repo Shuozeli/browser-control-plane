@@ -263,6 +263,21 @@ impl ArtifactStore {
         Ok(())
     }
 
+    /// Resolve an artifact's metadata and on-disk path for streaming it back to
+    /// a client (the read side of the out-of-band file bypass — e.g. a file the
+    /// browser downloaded to this machine). Returns `NotFound` if unknown.
+    pub fn open_for_read(&self, artifact_id: &str) -> Result<(Artifact, PathBuf), ArtifactError> {
+        let artifact = self
+            .get(artifact_id)?
+            .ok_or_else(|| ArtifactError::NotFound(artifact_id.to_string()))?;
+        let path = self
+            .config
+            .root_dir
+            .join("files")
+            .join(&artifact.stored_filename);
+        Ok((artifact, path))
+    }
+
     fn get(&self, artifact_id: &str) -> Result<Option<Artifact>, ArtifactError> {
         let mut conn = self.conn.lock().expect("artifact sqlite lock poisoned");
         let tx = conn.transaction()?;

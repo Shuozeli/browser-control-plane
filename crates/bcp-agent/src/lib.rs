@@ -10,12 +10,14 @@ use bcp_core::id::UuidIdGenerator;
 use bcp_core::pwright::{PwrightError, PwrightGateway, SharedPwrightGateway};
 use bcp_core::time::{Clock, SystemClock};
 use bcp_proto::browsercontrol::v1::machine_controller_server::MachineController;
+use bcp_proto::browsercontrol::v1::download_artifact_response::Part as DownloadPart;
 use bcp_proto::browsercontrol::v1::upload_artifact_request::Part;
 use bcp_proto::browsercontrol::v1::*;
 use tonic::{Request, Response, Status};
 
 pub mod config;
 pub mod lifecycle;
+pub mod proxy;
 
 #[derive(Clone)]
 pub struct AgentService {
@@ -197,6 +199,36 @@ impl AgentService {
         Ok(lease.profile_id)
     }
 
+    /// Lease check for the raw CDP proxy, which cannot surface a gRPC `Status`.
+    /// Applies the same rules as [`AgentService::validate_lease`]: the lease must
+    /// be installed, match the profile and fencing token, and not be expired.
+    pub fn check_lease(&self, lease_id: &str, profile_id: &str, fencing_token: &str) -> bool {
+        if lease_id.is_empty() || profile_id.is_empty() || fencing_token.is_empty() {
+            return false;
+        }
+        let leases = self.leases.read().expect("agent lease lock poisoned");
+        let Some(local) = leases.get(lease_id) else {
+            return false;
+        };
+        if local.profile_id != profile_id || local.fencing_token != fencing_token {
+            return false;
+        }
+        if local.expires_at_unix_ms > 0 && self.clock.now_unix_ms() >= local.expires_at_unix_ms {
+            return false;
+        }
+        true
+    }
+
+    /// Resolve a profile's local Chrome DevTools HTTP base URL (e.g.
+    /// `http://127.0.0.1:9222`) so the proxy can reach and rewrite it.
+    pub fn profile_cdp_url(&self, profile_id: &str) -> Option<String> {
+        self.list_profiles()
+            .into_iter()
+            .find(|profile| profile.profile_id == profile_id)
+            .map(|profile| profile.cdp_url)
+            .filter(|url| !url.is_empty())
+    }
+
     fn pwright_error_to_status(error: PwrightError) -> Status {
         match error {
             PwrightError::ProfileNotFound(_) => Status::not_found(error.to_string()),
@@ -364,6 +396,165 @@ impl MachineController for AgentService {
         self.fleet
             .record_operation("browser.eval", &profile_id, "evaluate expression");
         Ok(Response::new(EvaluateResponse { json_result }))
+    }
+
+    async fn capture_screenshot(
+        &self,
+        request: Request<CaptureScreenshotRequest>,
+    ) -> Result<Response<CaptureScreenshotResponse>, Status> {
+        let request = request.into_inner();
+        let profile_id = self.validate_lease(request.lease)?;
+        let base64_data = self
+            .pwright
+            .capture_screenshot(&profile_id, &request.format, request.full_page)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.screenshot", &profile_id, "captured screenshot");
+        let format = if request.format.is_empty() {
+            "png".to_string()
+        } else {
+            request.format
+        };
+        Ok(Response::new(CaptureScreenshotResponse {
+            base64_data,
+            format,
+        }))
+    }
+
+    async fn print_pdf(
+        &self,
+        request: Request<PrintPdfRequest>,
+    ) -> Result<Response<PrintPdfResponse>, Status> {
+        let profile_id = self.validate_lease(request.into_inner().lease)?;
+        let base64_data = self
+            .pwright
+            .print_pdf(&profile_id)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.pdf", &profile_id, "printed pdf");
+        Ok(Response::new(PrintPdfResponse { base64_data }))
+    }
+
+    async fn get_cookies(
+        &self,
+        request: Request<GetCookiesRequest>,
+    ) -> Result<Response<GetCookiesResponse>, Status> {
+        let profile_id = self.validate_lease(request.into_inner().lease)?;
+        let cookies_json = self
+            .pwright
+            .get_cookies(&profile_id)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.get_cookies", &profile_id, "read cookies");
+        Ok(Response::new(GetCookiesResponse { cookies_json }))
+    }
+
+    async fn set_cookies(
+        &self,
+        request: Request<SetCookiesRequest>,
+    ) -> Result<Response<SetCookiesResponse>, Status> {
+        let request = request.into_inner();
+        let profile_id = self.validate_lease(request.lease)?;
+        let count = self
+            .pwright
+            .set_cookies(&profile_id, &request.cookies_json)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet.record_operation(
+            "browser.set_cookies",
+            &profile_id,
+            &format!("set {count} cookie(s)"),
+        );
+        Ok(Response::new(SetCookiesResponse { count }))
+    }
+
+    async fn get_page(
+        &self,
+        request: Request<GetPageRequest>,
+    ) -> Result<Response<GetPageResponse>, Status> {
+        let profile_id = self.validate_lease(request.into_inner().lease)?;
+        let info = self
+            .pwright
+            .get_page(&profile_id)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet
+            .record_operation("browser.get_page", &profile_id, "read page info");
+        Ok(Response::new(GetPageResponse {
+            url: info.url,
+            title: info.title,
+            content: info.content,
+        }))
+    }
+
+    async fn set_input_files(
+        &self,
+        request: Request<SetInputFilesRequest>,
+    ) -> Result<Response<SetInputFilesResponse>, Status> {
+        let request = request.into_inner();
+        let profile_id = self.validate_lease(request.lease)?;
+        self.pwright
+            .set_input_files(&profile_id, &request.selector, &request.files)
+            .await
+            .map_err(Self::pwright_error_to_status)?;
+        self.fleet.record_operation(
+            "browser.set_input_files",
+            &profile_id,
+            &format!("attached {} file(s)", request.files.len()),
+        );
+        Ok(Response::new(SetInputFilesResponse { ok: true }))
+    }
+
+    type DownloadArtifactStream = Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<
+                    Item = Result<DownloadArtifactResponse, Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
+
+    async fn download_artifact(
+        &self,
+        request: Request<DownloadArtifactRequest>,
+    ) -> Result<Response<Self::DownloadArtifactStream>, Status> {
+        let request = request.into_inner();
+        let profile_id = self.validate_lease(request.lease)?;
+        let (artifact, path) = self
+            .artifacts
+            .open_for_read(&request.artifact_id)
+            .map_err(Self::artifact_error_to_status)?;
+        // An artifact is only retrievable through the lease that owns its profile.
+        if artifact.profile_id != profile_id {
+            return Err(Status::permission_denied(
+                "artifact does not belong to this lease's profile",
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|error| Status::internal(error.to_string()))?;
+        self.fleet.record_operation(
+            "browser.download_artifact",
+            &profile_id,
+            &format!("streamed {} bytes", bytes.len()),
+        );
+        let mut messages = Vec::new();
+        messages.push(DownloadArtifactResponse {
+            part: Some(DownloadPart::Metadata(ArtifactDownloadMetadata {
+                artifact_id: artifact.artifact_id,
+                original_filename: artifact.original_filename,
+                content_type: artifact.content_type,
+                size_bytes: artifact.size_bytes,
+            })),
+        });
+        for chunk in bytes.chunks(64 * 1024) {
+            messages.push(DownloadArtifactResponse {
+                part: Some(DownloadPart::Chunk(chunk.to_vec())),
+            });
+        }
+        let stream = tonic::codegen::tokio_stream::iter(messages.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     type RunScriptStream = Pin<
@@ -561,6 +752,47 @@ impl PwrightGateway for EmptyPwrightGateway {
         _yaml: &str,
         _params: HashMap<String, String>,
     ) -> Result<Vec<RunScriptResponse>, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn capture_screenshot(
+        &self,
+        profile_id: &str,
+        _format: &str,
+        _full_page: bool,
+    ) -> Result<String, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn set_cookies(
+        &self,
+        profile_id: &str,
+        _cookies_json: &str,
+    ) -> Result<u32, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn get_page(
+        &self,
+        profile_id: &str,
+    ) -> Result<bcp_core::pwright::PageInfo, PwrightError> {
+        Err(PwrightError::ProfileNotFound(profile_id.to_string()))
+    }
+
+    async fn set_input_files(
+        &self,
+        profile_id: &str,
+        _selector: &str,
+        _files: &[String],
+    ) -> Result<(), PwrightError> {
         Err(PwrightError::ProfileNotFound(profile_id.to_string()))
     }
 }

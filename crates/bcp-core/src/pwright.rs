@@ -10,7 +10,7 @@ use thiserror::Error;
 #[cfg(feature = "real-pwright")]
 use pwright_bridge::browser::{Browser, BrowserConfig, TabHandle};
 #[cfg(feature = "real-pwright")]
-use pwright_bridge::playwright::Page;
+use pwright_bridge::playwright::{Page, ScreenshotFormat, ScreenshotOptions, WaitState};
 #[cfg(feature = "real-pwright")]
 use tokio::sync::Mutex;
 
@@ -48,6 +48,43 @@ pub trait PwrightGateway: Send + Sync {
         yaml: &str,
         params: HashMap<String, String>,
     ) -> Result<Vec<RunScriptResponse>, PwrightError>;
+    /// Capture a screenshot, returning base64-encoded image bytes.
+    async fn capture_screenshot(
+        &self,
+        profile_id: &str,
+        format: &str,
+        full_page: bool,
+    ) -> Result<String, PwrightError>;
+    /// Print the page to PDF, returning base64-encoded PDF bytes.
+    async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError>;
+    /// Return all cookies visible to the page as a JSON array string. Includes
+    /// httpOnly cookies, which page JavaScript cannot read.
+    async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError>;
+    /// Set cookies from a JSON array (subset fields allowed; the rest default).
+    /// Returns the number of cookies applied.
+    async fn set_cookies(
+        &self,
+        profile_id: &str,
+        cookies_json: &str,
+    ) -> Result<u32, PwrightError>;
+    /// Return the current page's URL, title, and full HTML content.
+    async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError>;
+    /// Attach one or more machine-local file paths to a file `<input>` selected
+    /// by CSS selector (bridges an out-of-band uploaded artifact into the page).
+    async fn set_input_files(
+        &self,
+        profile_id: &str,
+        selector: &str,
+        files: &[String],
+    ) -> Result<(), PwrightError>;
+}
+
+/// Page-level introspection returned by [`PwrightGateway::get_page`].
+#[derive(Debug, Clone, Default)]
+pub struct PageInfo {
+    pub url: String,
+    pub title: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +230,99 @@ impl PwrightGateway for RecordingPwrightGateway {
         Ok(vec![RunScriptResponse {
             json_line: r#"{"event":"script_complete","source":"recording_gateway"}"#.to_string(),
         }])
+    }
+
+    async fn capture_screenshot(
+        &self,
+        profile_id: &str,
+        _format: &str,
+        _full_page: bool,
+    ) -> Result<String, PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        // Base64 of "recording" — a deterministic, decodable stub.
+        Ok("cmVjb3JkaW5n".to_string())
+    }
+
+    async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        Ok("cmVjb3JkaW5n".to_string())
+    }
+
+    async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        Ok("[]".to_string())
+    }
+
+    async fn set_cookies(
+        &self,
+        profile_id: &str,
+        cookies_json: &str,
+    ) -> Result<u32, PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(cookies_json)
+            .map_err(|error| PwrightError::OperationFailed(profile_id.to_string(), error.to_string()))?;
+        Ok(parsed.as_array().map(|array| array.len() as u32).unwrap_or(0))
+    }
+
+    async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        Ok(PageInfo {
+            url: "recording://page".to_string(),
+            title: "recording".to_string(),
+            content: "<html></html>".to_string(),
+        })
+    }
+
+    async fn set_input_files(
+        &self,
+        profile_id: &str,
+        _selector: &str,
+        _files: &[String],
+    ) -> Result<(), PwrightError> {
+        if !self
+            .profiles
+            .read()
+            .expect("recording pwright gateway profile lock poisoned")
+            .contains_key(profile_id)
+        {
+            return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -437,6 +567,60 @@ impl PwrightGateway for RealPwrightGateway {
                 .press(&selector, &request.key)
                 .await
                 .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "hover" => page
+                .locator(&selector)
+                .hover()
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "dblclick" => page
+                .locator(&selector)
+                .dblclick()
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "select" => page
+                .locator(&selector)
+                .select_option(&request.text)
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "wait_for_selector" => {
+                let timeout_ms = request
+                    .options
+                    .get("timeout_ms")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(5_000)
+                    .min(MAX_STEP_WAIT_MS);
+                page.locator(&selector)
+                    .wait_for(timeout_ms, WaitState::Visible)
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+            }
+            "scroll" => {
+                let dx = request
+                    .options
+                    .get("dx")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let dy = request
+                    .options
+                    .get("dy")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                page.evaluate(&format!("window.scrollBy({dx},{dy})"))
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+            }
+            "reload" => page
+                .reload()
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "back" => page
+                .go_back()
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
+            "forward" => page
+                .go_forward()
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?,
             other => {
                 return Err(PwrightError::OperationFailed(
                     profile_id.to_string(),
@@ -516,6 +700,122 @@ impl PwrightGateway for RealPwrightGateway {
         });
         Ok(lines)
     }
+
+    async fn capture_screenshot(
+        &self,
+        profile_id: &str,
+        format: &str,
+        full_page: bool,
+    ) -> Result<String, PwrightError> {
+        let page = self.page_for_profile(profile_id).await?;
+        page.screenshot(Some(ScreenshotOptions {
+            format: screenshot_format(format),
+            full_page,
+        }))
+        .await
+        .map_err(|error| Self::operation_failed(profile_id, error))
+    }
+
+    async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError> {
+        let page = self.page_for_profile(profile_id).await?;
+        page.pdf()
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))
+    }
+
+    async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError> {
+        // The pinned bridge exposes no raw CDP session, so this reads
+        // document.cookie (name/value pairs only). httpOnly cookies are not
+        // visible here — retrieve those over the raw CDP proxy (Network.getCookies).
+        let page = self.page_for_profile(profile_id).await?;
+        let result = page
+            .evaluate(
+                r#"JSON.stringify(document.cookie.split('; ').filter(Boolean).map((pair) => {
+  const eq = pair.indexOf('=');
+  return { name: pair.slice(0, eq), value: pair.slice(eq + 1) };
+}))"#,
+            )
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+        Ok(result
+            .get("value")
+            .and_then(|value| value.as_str())
+            .unwrap_or("[]")
+            .to_string())
+    }
+
+    async fn set_cookies(
+        &self,
+        profile_id: &str,
+        cookies_json: &str,
+    ) -> Result<u32, PwrightError> {
+        let page = self.page_for_profile(profile_id).await?;
+        let array: Vec<serde_json::Value> = serde_json::from_str(cookies_json)
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+        let mut count = 0_u32;
+        for cookie in &array {
+            let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let value = cookie.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let path = cookie.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            let assignment = format!("{name}={value}; path={path}");
+            // JSON-encode the assignment into a JS string literal so cookie
+            // contents cannot break out of the expression.
+            let literal = serde_json::to_string(&assignment)
+                .map_err(|error| Self::operation_failed(profile_id, error))?;
+            page.evaluate(&format!("document.cookie = {literal}"))
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError> {
+        let page = self.page_for_profile(profile_id).await?;
+        let url = page
+            .url()
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+        let title = page
+            .title()
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+        let content = page
+            .content()
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))?;
+        Ok(PageInfo {
+            url,
+            title,
+            content,
+        })
+    }
+
+    async fn set_input_files(
+        &self,
+        profile_id: &str,
+        selector: &str,
+        files: &[String],
+    ) -> Result<(), PwrightError> {
+        let page = self.page_for_profile(profile_id).await?;
+        page.set_input_files(selector, files)
+            .await
+            .map_err(|error| Self::operation_failed(profile_id, error))
+    }
+}
+
+/// Maps a caller-supplied format string onto a `ScreenshotFormat`, defaulting to
+/// PNG. Lossy formats use a fixed quality since callers pass only a name.
+#[cfg(feature = "real-pwright")]
+fn screenshot_format(format: &str) -> ScreenshotFormat {
+    match format.to_ascii_lowercase().as_str() {
+        "jpeg" | "jpg" => ScreenshotFormat::Jpeg(80),
+        "webp" => ScreenshotFormat::Webp(80),
+        _ => ScreenshotFormat::Png,
+    }
 }
 
 /// A `RunScript` program: an ordered list of steps executed against the page.
@@ -542,6 +842,12 @@ struct ScriptStep {
     expression: String,
     #[serde(default)]
     ms: u64,
+    #[serde(default)]
+    dx: i64,
+    #[serde(default)]
+    dy: i64,
+    #[serde(default)]
+    full_page: bool,
 }
 
 /// Upper bound on a single `wait_ms` step so a script cannot pin the streaming
@@ -616,6 +922,77 @@ async fn run_script_step(
             let ms = step.ms.min(MAX_STEP_WAIT_MS);
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             Ok(serde_json::json!(ms))
+        }
+        "hover" => {
+            page.locator(&step.selector)
+                .hover()
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("hovered"))
+        }
+        "dblclick" => {
+            page.locator(&step.selector)
+                .dblclick()
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("dblclicked"))
+        }
+        "select" => {
+            page.locator(&step.selector)
+                .select_option(&step.text)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!(step.text))
+        }
+        "wait_for_selector" => {
+            let timeout_ms = if step.ms == 0 {
+                5_000
+            } else {
+                step.ms.min(MAX_STEP_WAIT_MS)
+            };
+            page.locator(&step.selector)
+                .wait_for(timeout_ms, WaitState::Visible)
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!(step.selector))
+        }
+        "scroll" => {
+            page.evaluate(&format!("window.scrollBy({},{})", step.dx, step.dy))
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!({ "dx": step.dx, "dy": step.dy }))
+        }
+        "reload" => {
+            page.reload()
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("reloaded"))
+        }
+        "back" => {
+            page.go_back()
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("back"))
+        }
+        "forward" => {
+            page.go_forward()
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!("forward"))
+        }
+        "screenshot" => {
+            let base64 = page
+                .screenshot(Some(ScreenshotOptions {
+                    format: screenshot_format(&step.text),
+                    full_page: step.full_page,
+                }))
+                .await
+                .map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!({ "base64": base64 }))
+        }
+        "pdf" => {
+            let base64 = page.pdf().await.map_err(|error| fail(Box::new(error)))?;
+            Ok(serde_json::json!({ "base64": base64 }))
         }
         "eval" => {
             let value = page

@@ -172,6 +172,49 @@ impl PwrightGateway for LifecyclePwrightGateway {
     ) -> Result<Vec<RunScriptResponse>, PwrightError> {
         self.inner.run_script(profile_id, yaml, params).await
     }
+
+    async fn capture_screenshot(
+        &self,
+        profile_id: &str,
+        format: &str,
+        full_page: bool,
+    ) -> Result<String, PwrightError> {
+        self.inner
+            .capture_screenshot(profile_id, format, full_page)
+            .await
+    }
+
+    async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError> {
+        self.inner.print_pdf(profile_id).await
+    }
+
+    async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError> {
+        self.inner.get_cookies(profile_id).await
+    }
+
+    async fn set_cookies(
+        &self,
+        profile_id: &str,
+        cookies_json: &str,
+    ) -> Result<u32, PwrightError> {
+        self.inner.set_cookies(profile_id, cookies_json).await
+    }
+
+    async fn get_page(
+        &self,
+        profile_id: &str,
+    ) -> Result<bcp_core::pwright::PageInfo, PwrightError> {
+        self.inner.get_page(profile_id).await
+    }
+
+    async fn set_input_files(
+        &self,
+        profile_id: &str,
+        selector: &str,
+        files: &[String],
+    ) -> Result<(), PwrightError> {
+        self.inner.set_input_files(profile_id, selector, files).await
+    }
 }
 
 #[cfg(test)]

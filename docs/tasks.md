@@ -105,6 +105,57 @@
 - [x] Add fleet artifact metadata listing in global controller.
 - [ ] Add artifact metrics and structured events.
 
+## Phase 7: Full CDP Operation Coverage
+
+The semantic gateway currently exposes only `goto / click / fill / type / press /
+eval / wait_ms` plus a limited `snapshot`. That is a thin slice of CDP. This
+phase closes the gap so a lease holder can drive the remote browser as fully as a
+local one. Most items are wiring existing `pwright-bridge` methods
+(`screenshot`, `pdf`, `get_cookies` / `set_cookies`, `select_option`, `hover`,
+`scroll_page`, `wait_for`, `reload` / `go_back` / `go_forward`, `list_tabs` /
+`create_tab`) onto RPCs and script steps; a few need lower-level CDP sessions.
+
+Priority order (fill one by one, build + fleet-verify each):
+
+- [x] 7.1 Screenshot + PDF. Added `CaptureScreenshot` / `PrintPdf` machine RPCs
+      (base64 payload), gateway trait methods, agent handlers with `browser.*`
+      audit events, `screenshot` / `pdf` script steps, and `bcp screenshot` /
+      `bcp pdf` client verbs (decode base64 -> file).
+- [x] 7.2 Expanded input actions. Added `hover`, `dblclick`, `select`
+      (dropdown), `scroll` to `ExecuteAction` + `RunScript` steps.
+- [x] 7.3 Real waits. Added `wait_for_selector` (bridge `wait_for` +
+      `WaitState::Visible`), replacing blind `wait_ms` for correctness-sensitive
+      flows.
+- [x] 7.4 Navigation verbs. Added `reload`, `back`, `forward` actions/steps.
+- [x] 7.5 Cookies. Added `GetCookies` / `SetCookies` RPCs + gateway methods.
+      NOTE: the pinned `pwright-bridge` exposes no raw CDP session, so the
+      semantic path reads/writes `document.cookie` (name/value only). httpOnly
+      cookies are served full-fidelity by the raw proxy (7.12,
+      `Network.getCookies`/`setCookies`).
+- [x] 7.6 Page introspection. Added `GetPage` RPC returning `url` / `title` /
+      full HTML `content`. (a11y-tree upgrade of `snapshot` left as a follow-up;
+      the raw proxy exposes `Accessibility.getFullAXTree` meanwhile.)
+- [x] 7.7 Emulation. Delivered via the raw CDP proxy (7.12) — `Emulation.*`
+      (UA / geolocation / timezone / locale / device-metrics) is not in the
+      pinned bridge's typed surface, so it rides the passthrough full-fidelity.
+- [x] 7.8 File upload wired to the browser. Added `SetInputFiles` RPC
+      (`Page::set_input_files`) attaching machine-local artifact paths to a file
+      `<input>` — bridges the out-of-band upload into an in-page action.
+- [x] 7.9 File download retrieval. Added `DownloadArtifact` streaming RPC
+      (metadata + chunked bytes) to pull a machine-local file back off-band;
+      `Browser.setDownloadBehavior` itself rides the raw proxy.
+- [x] 7.10 Multi-tab / target. Delivered via the raw proxy — the CDP `Target`
+      domain (create/attach/close targets) passes through untouched.
+- [x] 7.11 Dialog handling. Delivered via the raw proxy —
+      `Page.handleJavaScriptDialog` passes through.
+- [x] 7.12 Raw CDP passthrough. Lease-gated transparent proxy in the agent
+      (`proxy.rs`, sibling port): HTTP `/{profile}/json*` fetched from local
+      Chrome with `webSocketDebuggerUrl` rewritten back to the proxy (carrying
+      the lease token), and WebSocket `/{profile}/devtools/*` relayed
+      frame-for-frame. External DevTools clients (pwright / puppeteer /
+      chrome-devtools-mcp) get the full ~700-command surface. Out-of-band file
+      transfer stays on 7.8 / 7.9. See `docs/cdp-proxy-design.md`.
+
 ## Phase 6: HTML Console
 
 - [x] Add read-only HTML console design review.

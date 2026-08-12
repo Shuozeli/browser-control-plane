@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerClient;
 use bcp_proto::browsercontrol::v1::machine_controller_client::MachineControllerClient;
 use bcp_proto::browsercontrol::v1::{
-    AccountPlatform, AcquireBrowserRequest, BrowserLease, BrowserRoute, EnsureBrowserRequest,
-    EvaluateRequest, GetRouteRequest, GetSnapshotRequest, InstallLeaseRequest, LeaseContext,
-    ListControlPlaneEventsRequest, ListMachinesRequest, LookupBrowserConnectionRequest,
-    QuarantineProfileRequest, ReleaseLeaseRequest, ReleaseQuarantineRequest, RunScriptRequest,
+    AccountPlatform, AcquireBrowserRequest, BrowserLease, BrowserRoute, CaptureScreenshotRequest,
+    EnsureBrowserRequest, EvaluateRequest, GetRouteRequest, GetSnapshotRequest,
+    InstallLeaseRequest, LeaseContext, ListControlPlaneEventsRequest, ListMachinesRequest,
+    LookupBrowserConnectionRequest, PrintPdfRequest, QuarantineProfileRequest, ReleaseLeaseRequest,
+    ReleaseQuarantineRequest, RunScriptRequest,
 };
+use base64::Engine;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -88,6 +90,48 @@ enum Command {
         /// Path to a YAML script file.
         #[arg(long)]
         file: std::path::PathBuf,
+    },
+    /// Directly install a lease on a machine controller (agent) without going
+    /// through the global controller. Useful for manual/raw-CDP-proxy access.
+    Install {
+        /// Machine controller (agent) gRPC endpoint, e.g. http://host:7100.
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        lease_id: String,
+        #[arg(long)]
+        profile_id: String,
+        #[arg(long)]
+        fencing_token: String,
+        /// Lease lifetime in seconds (agent rejects the lease past this).
+        #[arg(long, default_value_t = 600)]
+        ttl_seconds: i64,
+    },
+    /// Acquire, capture a screenshot to a file, then release.
+    Screenshot {
+        #[arg(long)]
+        platform: String,
+        #[arg(long)]
+        account_id: String,
+        /// Output image file.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Image format: png (default), jpeg, or webp.
+        #[arg(long, default_value = "png")]
+        format: String,
+        /// Capture the full scrollable page instead of just the viewport.
+        #[arg(long, default_value_t = false)]
+        full_page: bool,
+    },
+    /// Acquire, print the page to a PDF file, then release.
+    Pdf {
+        #[arg(long)]
+        platform: String,
+        #[arg(long)]
+        account_id: String,
+        /// Output PDF file.
+        #[arg(long)]
+        out: std::path::PathBuf,
     },
     /// Quarantine a profile so it is no longer selected for acquire.
     Quarantine {
@@ -293,6 +337,102 @@ async fn main() -> anyhow::Result<()> {
             while let Some(line) = stream.message().await? {
                 println!("{}", line.json_line);
             }
+            release(&mut controller, &lease).await;
+        }
+        Command::Install {
+            agent,
+            lease_id,
+            profile_id,
+            fencing_token,
+            ttl_seconds,
+        } => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|delta| delta.as_millis() as i64)
+                .unwrap_or(0);
+            let mut client = MachineControllerClient::connect(agent).await?;
+            let response = client
+                .install_lease(InstallLeaseRequest {
+                    lease: Some(LeaseContext {
+                        lease_id: lease_id.clone(),
+                        profile_id,
+                        fencing_token,
+                        expires_at_unix_ms: now_ms + ttl_seconds * 1000,
+                    }),
+                })
+                .await?
+                .into_inner();
+            println!("installed={} lease_id={}", response.installed, lease_id);
+        }
+        Command::Screenshot {
+            platform,
+            account_id,
+            out,
+            format,
+            full_page,
+        } => {
+            let mut controller = GlobalControllerClient::connect(args.controller).await?;
+            let (lease, route) = acquire(&mut controller, &platform, &account_id, 120).await?;
+            let context = lease_context(&lease);
+            let mut agent = MachineControllerClient::connect(route.agent_grpc_addr.clone()).await?;
+            agent
+                .install_lease(InstallLeaseRequest {
+                    lease: Some(context.clone()),
+                })
+                .await?;
+            agent
+                .ensure_browser(EnsureBrowserRequest {
+                    lease: Some(context.clone()),
+                })
+                .await?;
+            let result = agent
+                .capture_screenshot(CaptureScreenshotRequest {
+                    lease: Some(context),
+                    format,
+                    full_page,
+                })
+                .await?
+                .into_inner();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result.base64_data.as_bytes())?;
+            std::fs::write(&out, &bytes)?;
+            println!(
+                "wrote {}-byte {} screenshot to {}",
+                bytes.len(),
+                result.format,
+                out.display()
+            );
+            release(&mut controller, &lease).await;
+        }
+        Command::Pdf {
+            platform,
+            account_id,
+            out,
+        } => {
+            let mut controller = GlobalControllerClient::connect(args.controller).await?;
+            let (lease, route) = acquire(&mut controller, &platform, &account_id, 120).await?;
+            let context = lease_context(&lease);
+            let mut agent = MachineControllerClient::connect(route.agent_grpc_addr.clone()).await?;
+            agent
+                .install_lease(InstallLeaseRequest {
+                    lease: Some(context.clone()),
+                })
+                .await?;
+            agent
+                .ensure_browser(EnsureBrowserRequest {
+                    lease: Some(context.clone()),
+                })
+                .await?;
+            let result = agent
+                .print_pdf(PrintPdfRequest {
+                    lease: Some(context),
+                })
+                .await?
+                .into_inner();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result.base64_data.as_bytes())?;
+            std::fs::write(&out, &bytes)?;
+            println!("wrote {}-byte PDF to {}", bytes.len(), out.display());
             release(&mut controller, &lease).await;
         }
         Command::Quarantine { profile_id, reason } => {

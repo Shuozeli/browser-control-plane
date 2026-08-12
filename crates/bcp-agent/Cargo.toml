@@ -8,13 +8,18 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+axum = { version = "0.8", features = ["ws"] }
 bcp-core.workspace = true
 bcp-proto.workspace = true
 clap.workspace = true
+futures-util = "0.3"
 prost.workspace = true
+reqwest = { version = "0.12", default-features = false }
 rusqlite.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite = "0.26"
 toml.workspace = true
 tonic.workspace = true
 tracing.workspace = true
