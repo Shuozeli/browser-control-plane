@@ -9,9 +9,11 @@ COPY . .
 
 RUN CARGO_INCREMENTAL=0 cargo build --release \
     -p bcp-controller \
-    -p bcp-agent \
     -p bcp-client \
     -p bcp-e2e
+# The agent must be built with real-pwright so it drives real Chrome via the CDP
+# gateway; the default build compiles a stub that errors at runtime.
+RUN CARGO_INCREMENTAL=0 cargo build --release -p bcp-agent --features real-pwright
 
 FROM debian:bookworm-slim
 
