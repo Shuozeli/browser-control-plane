@@ -12,6 +12,8 @@ use pwright_bridge::browser::{Browser, BrowserConfig, TabHandle};
 #[cfg(feature = "real-pwright")]
 use pwright_bridge::playwright::{Page, ScreenshotFormat, ScreenshotOptions, WaitState};
 #[cfg(feature = "real-pwright")]
+use std::{future::Future, pin::Pin};
+#[cfg(feature = "real-pwright")]
 use tokio::sync::Mutex;
 
 #[derive(Debug, Error)]
@@ -62,11 +64,7 @@ pub trait PwrightGateway: Send + Sync {
     async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError>;
     /// Set cookies from a JSON array (subset fields allowed; the rest default).
     /// Returns the number of cookies applied.
-    async fn set_cookies(
-        &self,
-        profile_id: &str,
-        cookies_json: &str,
-    ) -> Result<u32, PwrightError>;
+    async fn set_cookies(&self, profile_id: &str, cookies_json: &str) -> Result<u32, PwrightError>;
     /// Return the current page's URL, title, and full HTML content.
     async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError>;
     /// Attach one or more machine-local file paths to a file `<input>` selected
@@ -274,11 +272,7 @@ impl PwrightGateway for RecordingPwrightGateway {
         Ok("[]".to_string())
     }
 
-    async fn set_cookies(
-        &self,
-        profile_id: &str,
-        cookies_json: &str,
-    ) -> Result<u32, PwrightError> {
+    async fn set_cookies(&self, profile_id: &str, cookies_json: &str) -> Result<u32, PwrightError> {
         if !self
             .profiles
             .read()
@@ -287,9 +281,13 @@ impl PwrightGateway for RecordingPwrightGateway {
         {
             return Err(PwrightError::ProfileNotFound(profile_id.to_string()));
         }
-        let parsed: serde_json::Value = serde_json::from_str(cookies_json)
-            .map_err(|error| PwrightError::OperationFailed(profile_id.to_string(), error.to_string()))?;
-        Ok(parsed.as_array().map(|array| array.len() as u32).unwrap_or(0))
+        let parsed: serde_json::Value = serde_json::from_str(cookies_json).map_err(|error| {
+            PwrightError::OperationFailed(profile_id.to_string(), error.to_string())
+        })?;
+        Ok(parsed
+            .as_array()
+            .map(|array| array.len() as u32)
+            .unwrap_or(0))
     }
 
     async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError> {
@@ -376,6 +374,50 @@ impl RealPwrightGateway {
 
     fn operation_failed(profile_id: &str, error: impl std::fmt::Display) -> PwrightError {
         PwrightError::OperationFailed(profile_id.to_string(), error.to_string())
+    }
+
+    /// Drop a profile's cached browser so the next `ensure_browser` reconnects.
+    async fn evict(&self, profile_id: &str) {
+        self.active.lock().await.remove(profile_id);
+    }
+
+    /// True when an error looks like a dropped CDP transport (a stale cached
+    /// websocket), so the operation is worth retrying against a fresh connection.
+    fn is_connection_closed(error: &PwrightError) -> bool {
+        match error {
+            PwrightError::OperationFailed(_, message) => {
+                let message = message.to_ascii_lowercase();
+                message.contains("connection closed")
+                    || message.contains("reset")
+                    || message.contains("closing handshake")
+                    || message.contains("broken pipe")
+                    || message.contains("not connected")
+            }
+            _ => false,
+        }
+    }
+
+    /// Run a page operation, and if it fails because the cached CDP connection
+    /// is dead, evict it, reconnect once, and retry. This makes a transient
+    /// disconnect self-heal instead of wedging the profile forever (the cached
+    /// handle was previously reused blindly by `ensure_browser`).
+    async fn with_reconnect<'a, T, F>(
+        &'a self,
+        profile_id: &'a str,
+        op: F,
+    ) -> Result<T, PwrightError>
+    where
+        F: Fn(Page) -> Pin<Box<dyn Future<Output = Result<T, PwrightError>> + Send + 'a>>,
+    {
+        let page = self.page_for_profile(profile_id).await?;
+        match op(page).await {
+            Err(error) if Self::is_connection_closed(&error) => {
+                self.evict(profile_id).await;
+                let page = self.page_for_profile(profile_id).await?;
+                op(page).await
+            }
+            other => other,
+        }
     }
 }
 
@@ -479,10 +521,11 @@ impl PwrightGateway for RealPwrightGateway {
     }
 
     async fn get_snapshot(&self, profile_id: &str) -> Result<Vec<A11yNode>, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        let result = page
-            .evaluate(
-                r#"
+        self.with_reconnect(profile_id, |page| {
+            Box::pin(async move {
+                let result = page
+                    .evaluate(
+                        r#"
 (() => {
   const els = Array.from(document.querySelectorAll('button,input,textarea,select,a,[role="button"]'));
   return JSON.stringify(els.map((el, index) => {
@@ -494,49 +537,52 @@ impl PwrightGateway for RealPwrightGateway {
   }));
 })()
                         "#,
-            )
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        let raw = result
-            .get("value")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                PwrightError::OperationFailed(
-                    profile_id.to_string(),
-                    format!("unexpected snapshot result: {result}"),
-                )
-            })?;
-        let nodes: Vec<serde_json::Value> =
-            serde_json::from_str(raw).map_err(|error| Self::operation_failed(profile_id, error))?;
-        Ok(nodes
-            .into_iter()
-            .map(|node| A11yNode {
-                r#ref: node
-                    .get("ref")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                role: node
-                    .get("role")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                name: node
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                depth: node
-                    .get("depth")
-                    .and_then(|value| value.as_i64())
-                    .unwrap_or_default() as i32,
-                value: node
+                    )
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                let raw = result
                     .get("value")
                     .and_then(|value| value.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                    .ok_or_else(|| {
+                        PwrightError::OperationFailed(
+                            profile_id.to_string(),
+                            format!("unexpected snapshot result: {result}"),
+                        )
+                    })?;
+                let nodes: Vec<serde_json::Value> = serde_json::from_str(raw)
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                Ok(nodes
+                    .into_iter()
+                    .map(|node| A11yNode {
+                        r#ref: node
+                            .get("ref")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        role: node
+                            .get("role")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: node
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        depth: node
+                            .get("depth")
+                            .and_then(|value| value.as_i64())
+                            .unwrap_or_default() as i32,
+                        value: node
+                            .get("value")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                    .collect())
             })
-            .collect())
+        })
+        .await
     }
 
     async fn execute_action(
@@ -544,109 +590,119 @@ impl PwrightGateway for RealPwrightGateway {
         profile_id: &str,
         request: ExecuteActionRequest,
     ) -> Result<ExecuteActionResponse, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
         let selector = request
             .options
             .get("selector")
             .cloned()
             .unwrap_or_else(|| format!(r#"[data-bcp-ref="{}"]"#, request.r#ref));
-        match request.action.as_str() {
-            "click" => page
-                .click(&selector)
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "fill" => page
-                .fill(&selector, &request.text)
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "type" => page
-                .type_text(&selector, &request.text)
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "press" => page
-                .press(&selector, &request.key)
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "hover" => page
-                .locator(&selector)
-                .hover()
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "dblclick" => page
-                .locator(&selector)
-                .dblclick()
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "select" => page
-                .locator(&selector)
-                .select_option(&request.text)
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "wait_for_selector" => {
-                let timeout_ms = request
-                    .options
-                    .get("timeout_ms")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(5_000)
-                    .min(MAX_STEP_WAIT_MS);
-                page.locator(&selector)
-                    .wait_for(timeout_ms, WaitState::Visible)
-                    .await
-                    .map_err(|error| Self::operation_failed(profile_id, error))?;
-            }
-            "scroll" => {
-                let dx = request
-                    .options
-                    .get("dx")
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let dy = request
-                    .options
-                    .get("dy")
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .unwrap_or(0);
-                page.evaluate(&format!("window.scrollBy({dx},{dy})"))
-                    .await
-                    .map_err(|error| Self::operation_failed(profile_id, error))?;
-            }
-            "reload" => page
-                .reload()
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "back" => page
-                .go_back()
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            "forward" => page
-                .go_forward()
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?,
-            other => {
-                return Err(PwrightError::OperationFailed(
-                    profile_id.to_string(),
-                    format!("unsupported real-browser action: {other}"),
-                ));
-            }
-        }
-        Ok(ExecuteActionResponse {
-            success: true,
-            message: "real pwright CDP action executed".to_string(),
+        let request = &request;
+        let selector = selector.as_str();
+        self.with_reconnect(profile_id, move |page| {
+            Box::pin(async move {
+                match request.action.as_str() {
+                    "click" => page
+                        .click(selector)
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "fill" => page
+                        .fill(selector, &request.text)
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "type" => page
+                        .type_text(selector, &request.text)
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "press" => page
+                        .press(selector, &request.key)
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "hover" => page
+                        .locator(selector)
+                        .hover()
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "dblclick" => page
+                        .locator(selector)
+                        .dblclick()
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "select" => page
+                        .locator(selector)
+                        .select_option(&request.text)
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "wait_for_selector" => {
+                        let timeout_ms = request
+                            .options
+                            .get("timeout_ms")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or(5_000)
+                            .min(MAX_STEP_WAIT_MS);
+                        page.locator(selector)
+                            .wait_for(timeout_ms, WaitState::Visible)
+                            .await
+                            .map_err(|error| Self::operation_failed(profile_id, error))?;
+                    }
+                    "scroll" => {
+                        let dx = request
+                            .options
+                            .get("dx")
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        let dy = request
+                            .options
+                            .get("dy")
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        page.evaluate(&format!("window.scrollBy({dx},{dy})"))
+                            .await
+                            .map_err(|error| Self::operation_failed(profile_id, error))?;
+                    }
+                    "reload" => page
+                        .reload()
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "back" => page
+                        .go_back()
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    "forward" => page
+                        .go_forward()
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?,
+                    other => {
+                        return Err(PwrightError::OperationFailed(
+                            profile_id.to_string(),
+                            format!("unsupported real-browser action: {other}"),
+                        ));
+                    }
+                }
+                Ok(ExecuteActionResponse {
+                    success: true,
+                    message: "real pwright CDP action executed".to_string(),
+                })
+            })
         })
+        .await
     }
 
     async fn evaluate(&self, profile_id: &str, expression: &str) -> Result<String, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        let result = page
-            .evaluate(expression)
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        if let Some(value) = result.get("value") {
-            if let Some(value) = value.as_str() {
-                return Ok(value.to_string());
-            }
-            return Ok(value.to_string());
-        }
-        Ok(result.to_string())
+        self.with_reconnect(profile_id, |page| {
+            Box::pin(async move {
+                let result = page
+                    .evaluate(expression)
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                if let Some(value) = result.get("value") {
+                    if let Some(value) = value.as_str() {
+                        return Ok(value.to_string());
+                    }
+                    return Ok(value.to_string());
+                }
+                Ok(result.to_string())
+            })
+        })
+        .await
     }
 
     async fn run_script(
@@ -655,7 +711,6 @@ impl PwrightGateway for RealPwrightGateway {
         yaml: &str,
         params: HashMap<String, String>,
     ) -> Result<Vec<RunScriptResponse>, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
         // Parse first, then substitute params into the parsed string fields, so a
         // param value cannot inject or reshape the YAML program.
         let mut script: ScriptSpec = serde_yaml::from_str(yaml)
@@ -664,33 +719,52 @@ impl PwrightGateway for RealPwrightGateway {
             step.apply_params(&params);
         }
 
-        let mut lines = Vec::new();
-        for (index, step) in script.steps.iter().enumerate() {
-            match run_script_step(&page, step).await {
-                Ok(result) => lines.push(RunScriptResponse {
-                    json_line: serde_json::json!({
-                        "step": index,
-                        "action": step.action,
-                        "ok": true,
-                        "result": result,
-                    })
-                    .to_string(),
-                }),
-                Err(error) => {
-                    lines.push(RunScriptResponse {
+        // Run the program; if a step fails because the cached CDP connection is
+        // dead, evict it and restart the program once against a fresh connection.
+        let mut reconnected = false;
+        let lines = loop {
+            let page = self.page_for_profile(profile_id).await?;
+            let mut lines = Vec::new();
+            let mut restart = false;
+            for (index, step) in script.steps.iter().enumerate() {
+                match run_script_step(&page, step).await {
+                    Ok(result) => lines.push(RunScriptResponse {
                         json_line: serde_json::json!({
                             "step": index,
                             "action": step.action,
-                            "ok": false,
-                            "error": error.to_string(),
+                            "ok": true,
+                            "result": result,
                         })
                         .to_string(),
-                    });
-                    // Stop at the first failing step so callers see where it broke.
-                    return Ok(lines);
+                    }),
+                    Err(error) => {
+                        if !reconnected && Self::is_connection_closed(&error) {
+                            // Stale cached connection: reconnect and rerun once.
+                            restart = true;
+                            break;
+                        }
+                        lines.push(RunScriptResponse {
+                            json_line: serde_json::json!({
+                                "step": index,
+                                "action": step.action,
+                                "ok": false,
+                                "error": error.to_string(),
+                            })
+                            .to_string(),
+                        });
+                        // Stop at the first failing step so callers see where it broke.
+                        return Ok(lines);
+                    }
                 }
             }
-        }
+            if restart {
+                reconnected = true;
+                self.evict(profile_id).await;
+                continue;
+            }
+            break lines;
+        };
+        let mut lines = lines;
         lines.push(RunScriptResponse {
             json_line: serde_json::json!({
                 "event": "script_complete",
@@ -707,91 +781,108 @@ impl PwrightGateway for RealPwrightGateway {
         format: &str,
         full_page: bool,
     ) -> Result<String, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        page.screenshot(Some(ScreenshotOptions {
-            format: screenshot_format(format),
-            full_page,
-        }))
+        self.with_reconnect(profile_id, move |page| {
+            Box::pin(async move {
+                page.screenshot(Some(ScreenshotOptions {
+                    format: screenshot_format(format),
+                    full_page,
+                }))
+                .await
+                .map_err(|error| Self::operation_failed(profile_id, error))
+            })
+        })
         .await
-        .map_err(|error| Self::operation_failed(profile_id, error))
     }
 
     async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        page.pdf()
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))
+        self.with_reconnect(profile_id, |page| {
+            Box::pin(async move {
+                page.pdf()
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))
+            })
+        })
+        .await
     }
 
     async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError> {
         // The pinned bridge exposes no raw CDP session, so this reads
         // document.cookie (name/value pairs only). httpOnly cookies are not
         // visible here — retrieve those over the raw CDP proxy (Network.getCookies).
-        let page = self.page_for_profile(profile_id).await?;
-        let result = page
-            .evaluate(
-                r#"JSON.stringify(document.cookie.split('; ').filter(Boolean).map((pair) => {
+        self.with_reconnect(profile_id, |page| {
+            Box::pin(async move {
+                let result = page
+                    .evaluate(
+                        r#"JSON.stringify(document.cookie.split('; ').filter(Boolean).map((pair) => {
   const eq = pair.indexOf('=');
   return { name: pair.slice(0, eq), value: pair.slice(eq + 1) };
 }))"#,
-            )
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        Ok(result
-            .get("value")
-            .and_then(|value| value.as_str())
-            .unwrap_or("[]")
-            .to_string())
+                    )
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                Ok(result
+                    .get("value")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("[]")
+                    .to_string())
+            })
+        })
+        .await
     }
 
-    async fn set_cookies(
-        &self,
-        profile_id: &str,
-        cookies_json: &str,
-    ) -> Result<u32, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
+    async fn set_cookies(&self, profile_id: &str, cookies_json: &str) -> Result<u32, PwrightError> {
         let array: Vec<serde_json::Value> = serde_json::from_str(cookies_json)
             .map_err(|error| Self::operation_failed(profile_id, error))?;
-        let mut count = 0_u32;
-        for cookie in &array {
-            let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let value = cookie.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            if name.is_empty() {
-                continue;
-            }
-            let path = cookie.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-            let assignment = format!("{name}={value}; path={path}");
-            // JSON-encode the assignment into a JS string literal so cookie
-            // contents cannot break out of the expression.
-            let literal = serde_json::to_string(&assignment)
-                .map_err(|error| Self::operation_failed(profile_id, error))?;
-            page.evaluate(&format!("document.cookie = {literal}"))
-                .await
-                .map_err(|error| Self::operation_failed(profile_id, error))?;
-            count += 1;
-        }
-        Ok(count)
+        let array = &array;
+        self.with_reconnect(profile_id, move |page| {
+            Box::pin(async move {
+                let mut count = 0_u32;
+                for cookie in array {
+                    let name = cookie.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = cookie.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let path = cookie.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                    let assignment = format!("{name}={value}; path={path}");
+                    // JSON-encode the assignment into a JS string literal so cookie
+                    // contents cannot break out of the expression.
+                    let literal = serde_json::to_string(&assignment)
+                        .map_err(|error| Self::operation_failed(profile_id, error))?;
+                    page.evaluate(&format!("document.cookie = {literal}"))
+                        .await
+                        .map_err(|error| Self::operation_failed(profile_id, error))?;
+                    count += 1;
+                }
+                Ok(count)
+            })
+        })
+        .await
     }
 
     async fn get_page(&self, profile_id: &str) -> Result<PageInfo, PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        let url = page
-            .url()
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        let title = page
-            .title()
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        let content = page
-            .content()
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))?;
-        Ok(PageInfo {
-            url,
-            title,
-            content,
+        self.with_reconnect(profile_id, |page| {
+            Box::pin(async move {
+                let url = page
+                    .url()
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                let title = page
+                    .title()
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                let content = page
+                    .content()
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))?;
+                Ok(PageInfo {
+                    url,
+                    title,
+                    content,
+                })
+            })
         })
+        .await
     }
 
     async fn set_input_files(
@@ -800,10 +891,14 @@ impl PwrightGateway for RealPwrightGateway {
         selector: &str,
         files: &[String],
     ) -> Result<(), PwrightError> {
-        let page = self.page_for_profile(profile_id).await?;
-        page.set_input_files(selector, files)
-            .await
-            .map_err(|error| Self::operation_failed(profile_id, error))
+        self.with_reconnect(profile_id, move |page| {
+            Box::pin(async move {
+                page.set_input_files(selector, files)
+                    .await
+                    .map_err(|error| Self::operation_failed(profile_id, error))
+            })
+        })
+        .await
     }
 }
 
@@ -963,9 +1058,7 @@ async fn run_script_step(
             Ok(serde_json::json!({ "dx": step.dx, "dy": step.dy }))
         }
         "reload" => {
-            page.reload()
-                .await
-                .map_err(|error| fail(Box::new(error)))?;
+            page.reload().await.map_err(|error| fail(Box::new(error)))?;
             Ok(serde_json::json!("reloaded"))
         }
         "back" => {
@@ -1106,5 +1199,45 @@ mod tests {
         assert_eq!(stopped_health.message, "recording pwright gateway stopped");
         assert!(recovered_health.healthy);
         assert_eq!(recovered_health.message, "recording pwright gateway ok");
+    }
+}
+
+#[cfg(all(test, feature = "real-pwright"))]
+mod real_pwright_tests {
+    use super::*;
+
+    fn op_failed(message: &str) -> PwrightError {
+        PwrightError::OperationFailed("profile".to_string(), message.to_string())
+    }
+
+    #[test]
+    fn is_connection_closed_matches_dropped_transport_errors() {
+        // Arrange / Act / Assert: the errors that should trigger evict+reconnect.
+        assert!(RealPwrightGateway::is_connection_closed(&op_failed(
+            "Connection closed"
+        )));
+        assert!(RealPwrightGateway::is_connection_closed(&op_failed(
+            "IO error: Connection reset by peer (os error 104)"
+        )));
+        assert!(RealPwrightGateway::is_connection_closed(&op_failed(
+            "WebSocket protocol error: Connection reset without closing handshake"
+        )));
+        assert!(RealPwrightGateway::is_connection_closed(&op_failed(
+            "Broken pipe"
+        )));
+    }
+
+    #[test]
+    fn is_connection_closed_ignores_ordinary_operation_errors() {
+        // Arrange / Act / Assert: real failures must not be retried as reconnects.
+        assert!(!RealPwrightGateway::is_connection_closed(&op_failed(
+            "no element matched selector '#missing'"
+        )));
+        assert!(!RealPwrightGateway::is_connection_closed(&op_failed(
+            "unsupported real-browser action: teleport"
+        )));
+        assert!(!RealPwrightGateway::is_connection_closed(
+            &PwrightError::ProfileNotFound("profile".to_string())
+        ));
     }
 }
