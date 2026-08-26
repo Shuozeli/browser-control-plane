@@ -192,11 +192,7 @@ impl PwrightGateway for LifecyclePwrightGateway {
         self.inner.get_cookies(profile_id).await
     }
 
-    async fn set_cookies(
-        &self,
-        profile_id: &str,
-        cookies_json: &str,
-    ) -> Result<u32, PwrightError> {
+    async fn set_cookies(&self, profile_id: &str, cookies_json: &str) -> Result<u32, PwrightError> {
         self.inner.set_cookies(profile_id, cookies_json).await
     }
 
@@ -213,7 +209,9 @@ impl PwrightGateway for LifecyclePwrightGateway {
         selector: &str,
         files: &[String],
     ) -> Result<(), PwrightError> {
-        self.inner.set_input_files(profile_id, selector, files).await
+        self.inner
+            .set_input_files(profile_id, selector, files)
+            .await
     }
 }
 

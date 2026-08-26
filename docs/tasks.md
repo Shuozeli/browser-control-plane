@@ -156,6 +156,26 @@ Priority order (fill one by one, build + fleet-verify each):
       chrome-devtools-mcp) get the full ~700-command surface. Out-of-band file
       transfer stays on 7.8 / 7.9. See `docs/cdp-proxy-design.md`.
 
+## Phase 8: Raw CDP proxy robustness (browserless-informed)
+
+Comparison against browserless's CDP ws proxy (thirdparty/browserless) surfaced
+three gaps in `bcp-agent/src/proxy.rs`. Unlike browserless (fresh browser per
+connection), BCP multiplexes many sequential client sessions onto one persistent
+logged-in Chrome, so clean teardown matters *more* for us.
+
+- [x] 8.1 Clean ws teardown. `bridge()` now, on any end (Close / read error /
+      stream end), sends a `Close` frame and `close()`s the sink toward each side,
+      so a shared long-lived Chrome is never left half-open (which reset the next
+      session). Mirrors browserless `this.close()` / `finish(err)`.
+- [x] 8.2 Log relay errors. Replaced `while let Some(Ok(..))` with an explicit
+      match that logs which side's ws read/forward failed (debug level), so resets
+      are diagnosable instead of silently swallowed.
+- [x] 8.3 Proxy `/json/new`. Added lease-gated `/{profile}/json/new` (GET+PUT)
+      that forwards to Chrome as PUT and rewrites the returned
+      `webSocketDebuggerUrl`; `split_lease_from_query` strips a `bcpLease=` token
+      from the query (or the lease comes via `Authorization`) so the remaining
+      query is the untouched target URL.
+
 ## Phase 6: HTML Console
 
 - [x] Add read-only HTML console design review.

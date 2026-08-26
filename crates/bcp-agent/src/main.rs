@@ -93,7 +93,9 @@ fn spawn_cdp_proxy(service: AgentService, grpc_addr: SocketAddr) {
     // External clients reach the proxy via the advertised host (MagicDNS when
     // set), so rewritten ws URLs are dialable from off-box.
     let public_host = match std::env::var("TAILSCALE_HOST") {
-        Ok(host) if !host.is_empty() => format!("{}:{}", host.trim_end_matches('.'), bind_addr.port()),
+        Ok(host) if !host.is_empty() => {
+            format!("{}:{}", host.trim_end_matches('.'), bind_addr.port())
+        }
         _ => bind_addr.to_string(),
     };
     tokio::spawn(async move {

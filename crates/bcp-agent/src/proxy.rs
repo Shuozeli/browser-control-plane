@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -77,6 +77,7 @@ pub fn router(service: AgentService, public_host: String) -> Router {
         .route("/{profile}/json/list", get(json_list))
         .route("/{profile}/json/version", get(json_version))
         .route("/{profile}/json/protocol", get(json_protocol))
+        .route("/{profile}/json/new", get(json_new).put(json_new))
         .route("/{profile}/devtools/{*rest}", get(ws_upgrade))
         .with_state(state)
 }
@@ -153,12 +154,18 @@ async fn proxy_json(
         Ok(response) => match response.text().await {
             Ok(text) => text,
             Err(error) => {
-                return (StatusCode::BAD_GATEWAY, format!("chrome read error: {error}"))
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("chrome read error: {error}"),
+                )
                     .into_response();
             }
         },
         Err(error) => {
-            return (StatusCode::BAD_GATEWAY, format!("chrome fetch error: {error}"))
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("chrome fetch error: {error}"),
+            )
                 .into_response();
         }
     };
@@ -169,6 +176,83 @@ async fn proxy_json(
             serde_json::to_string(&value).unwrap_or(body)
         }
         // /json/protocol and any non-JSON payload pass through unchanged.
+        Err(_) => body,
+    };
+    ([(header::CONTENT_TYPE, "application/json")], rewritten).into_response()
+}
+
+/// Split a `bcpLease=<lease>` credential out of Chrome's `/json/new` query,
+/// returning `(lease_token, remaining_query)`. Chrome treats the whole query as
+/// the URL to open, so the lease must be removed before forwarding; callers may
+/// instead pass the lease via the `Authorization` header and leave the query as
+/// the target URL.
+fn split_lease_from_query(raw: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(raw) = raw else {
+        return (None, None);
+    };
+    let mut token = None;
+    let mut rest: Vec<&str> = Vec::new();
+    for part in raw.split('&') {
+        if let Some(value) = part.strip_prefix("bcpLease=") {
+            // A literal ':' in the token is often percent-encoded in a query.
+            token = Some(value.replace("%3A", ":").replace("%3a", ":"));
+        } else if !part.is_empty() {
+            rest.push(part);
+        }
+    }
+    let remaining = (!rest.is_empty()).then(|| rest.join("&"));
+    (token, remaining)
+}
+
+/// `PUT|GET /{profile}/json/new?<url>` — create a new target on Chrome and
+/// return its rewritten `webSocketDebuggerUrl`. Chrome (modern) requires PUT.
+async fn json_new(
+    State(state): State<Arc<ProxyState>>,
+    Path(profile): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let (query_token, target_query) = split_lease_from_query(raw.as_deref());
+    let token = extract_token(&headers, &LeaseQuery::default()).or(query_token);
+    let Some(token) = token else {
+        return unauthorized();
+    };
+    if !authorize(&state, &profile, &token) {
+        return unauthorized();
+    }
+    let Some(base) = state.service.profile_cdp_url(&profile) else {
+        return (StatusCode::NOT_FOUND, "unknown profile").into_response();
+    };
+    let base = base.trim_end_matches('/');
+    let url = match target_query.as_deref().filter(|query| !query.is_empty()) {
+        Some(query) => format!("{base}/json/new?{query}"),
+        None => format!("{base}/json/new"),
+    };
+    let response = match reqwest::Client::new().put(&url).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("chrome /json/new error: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let body = match response.text().await {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("chrome read error: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let rewritten = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(mut value) => {
+            rewrite_ws_urls(&mut value, &profile, &token, &state.public_host);
+            serde_json::to_string(&value).unwrap_or(body)
+        }
         Err(_) => body,
     };
     ([(header::CONTENT_TYPE, "application/json")], rewritten).into_response()
@@ -238,43 +322,63 @@ async fn bridge(client: WebSocket, chrome_ws: String) {
     let (mut chrome_tx, mut chrome_rx) = chrome.split();
     let (mut client_tx, mut client_rx) = client.split();
 
-    // client -> chrome
+    // client -> chrome. On any end (client Close, read error, or stream end) we
+    // send a Close frame and close the upstream sink, so a shared long-lived
+    // Chrome is never left half-open (which resets the *next* session).
     let to_chrome = async {
-        while let Some(Ok(message)) = client_rx.next().await {
-            let forwarded = match message {
-                Message::Text(text) => TMessage::Text(text.as_str().into()),
-                Message::Binary(bytes) => TMessage::Binary(bytes.to_vec().into()),
-                Message::Ping(bytes) => TMessage::Ping(bytes.to_vec().into()),
-                Message::Pong(bytes) => TMessage::Pong(bytes.to_vec().into()),
-                Message::Close(_) => {
-                    let _ = chrome_tx.send(TMessage::Close(None)).await;
+        loop {
+            match client_rx.next().await {
+                Some(Ok(message)) => {
+                    let forwarded = match message {
+                        Message::Text(text) => TMessage::Text(text.as_str().into()),
+                        Message::Binary(bytes) => TMessage::Binary(bytes.to_vec().into()),
+                        Message::Ping(bytes) => TMessage::Ping(bytes.to_vec().into()),
+                        Message::Pong(bytes) => TMessage::Pong(bytes.to_vec().into()),
+                        Message::Close(_) => break,
+                    };
+                    if let Err(error) = chrome_tx.send(forwarded).await {
+                        tracing::debug!(%error, "cdp proxy: forward to chrome failed");
+                        break;
+                    }
+                }
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "cdp proxy: client ws read error");
                     break;
                 }
-            };
-            if chrome_tx.send(forwarded).await.is_err() {
-                break;
+                None => break,
             }
         }
+        let _ = chrome_tx.send(TMessage::Close(None)).await;
+        let _ = chrome_tx.close().await;
     };
 
-    // chrome -> client
+    // chrome -> client. Same clean-close discipline toward the client.
     let to_client = async {
-        while let Some(Ok(message)) = chrome_rx.next().await {
-            let forwarded = match message {
-                TMessage::Text(text) => Message::Text(text.to_string().into()),
-                TMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
-                TMessage::Ping(bytes) => Message::Ping(bytes.to_vec().into()),
-                TMessage::Pong(bytes) => Message::Pong(bytes.to_vec().into()),
-                TMessage::Close(_) => {
-                    let _ = client_tx.send(Message::Close(None)).await;
+        loop {
+            match chrome_rx.next().await {
+                Some(Ok(message)) => {
+                    let forwarded = match message {
+                        TMessage::Text(text) => Message::Text(text.to_string().into()),
+                        TMessage::Binary(bytes) => Message::Binary(bytes.to_vec().into()),
+                        TMessage::Ping(bytes) => Message::Ping(bytes.to_vec().into()),
+                        TMessage::Pong(bytes) => Message::Pong(bytes.to_vec().into()),
+                        TMessage::Close(_) => break,
+                        TMessage::Frame(_) => continue,
+                    };
+                    if let Err(error) = client_tx.send(forwarded).await {
+                        tracing::debug!(%error, "cdp proxy: forward to client failed");
+                        break;
+                    }
+                }
+                Some(Err(error)) => {
+                    tracing::debug!(%error, "cdp proxy: chrome ws read error");
                     break;
                 }
-                TMessage::Frame(_) => continue,
-            };
-            if client_tx.send(forwarded).await.is_err() {
-                break;
+                None => break,
             }
         }
+        let _ = client_tx.send(Message::Close(None)).await;
+        let _ = client_tx.close().await;
     };
 
     tokio::select! {
@@ -286,6 +390,28 @@ async fn bridge(client: WebSocket, chrome_ws: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_lease_from_query_separates_token_and_target() {
+        // Arrange / Act / Assert: lease (percent-encoded ':') + target URL.
+        let (token, target) =
+            split_lease_from_query(Some("bcpLease=lease1%3Atok1&https://example.com"));
+        assert_eq!(token.as_deref(), Some("lease1:tok1"));
+        assert_eq!(target.as_deref(), Some("https://example.com"));
+
+        // lease only (open about:blank)
+        let (token, target) = split_lease_from_query(Some("bcpLease=lease1:tok1"));
+        assert_eq!(token.as_deref(), Some("lease1:tok1"));
+        assert_eq!(target, None);
+
+        // target only (lease supplied via Authorization header)
+        let (token, target) = split_lease_from_query(Some("https://example.com"));
+        assert_eq!(token, None);
+        assert_eq!(target.as_deref(), Some("https://example.com"));
+
+        // nothing
+        assert_eq!(split_lease_from_query(None), (None, None));
+    }
 
     #[test]
     fn rewrite_one_points_ws_url_at_proxy_with_lease() {
@@ -350,7 +476,10 @@ mod tests {
     fn extract_token_reads_bearer_header_when_no_query() {
         // Arrange
         let mut headers = HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, "Bearer lease-7:fence-9".parse().unwrap());
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer lease-7:fence-9".parse().unwrap(),
+        );
         let query = LeaseQuery::default();
 
         // Act
