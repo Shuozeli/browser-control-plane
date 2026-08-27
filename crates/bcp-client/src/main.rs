@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::Engine;
 use bcp_proto::browsercontrol::v1::global_controller_client::GlobalControllerClient;
 use bcp_proto::browsercontrol::v1::machine_controller_client::MachineControllerClient;
 use bcp_proto::browsercontrol::v1::{
@@ -9,7 +10,6 @@ use bcp_proto::browsercontrol::v1::{
     LookupBrowserConnectionRequest, PrintPdfRequest, QuarantineProfileRequest, ReleaseLeaseRequest,
     ReleaseQuarantineRequest, RunScriptRequest,
 };
-use base64::Engine;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -393,8 +393,8 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?
                 .into_inner();
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(result.base64_data.as_bytes())?;
+            let bytes =
+                base64::engine::general_purpose::STANDARD.decode(result.base64_data.as_bytes())?;
             std::fs::write(&out, &bytes)?;
             println!(
                 "wrote {}-byte {} screenshot to {}",
@@ -429,8 +429,8 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?
                 .into_inner();
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(result.base64_data.as_bytes())?;
+            let bytes =
+                base64::engine::general_purpose::STANDARD.decode(result.base64_data.as_bytes())?;
             std::fs::write(&out, &bytes)?;
             println!("wrote {}-byte PDF to {}", bytes.len(), out.display());
             release(&mut controller, &lease).await;

@@ -200,8 +200,8 @@ impl AgentService {
     }
 
     /// Lease check for the raw CDP proxy, which cannot surface a gRPC `Status`.
-    /// Applies the same rules as [`AgentService::validate_lease`]: the lease must
-    /// be installed, match the profile and fencing token, and not be expired.
+    /// Applies the same rules as `validate_lease`: the lease must be installed,
+    /// match the profile and fencing token, and not be expired.
     pub fn check_lease(&self, lease_id: &str, profile_id: &str, fencing_token: &str) -> bool {
         if lease_id.is_empty() || profile_id.is_empty() || fencing_token.is_empty() {
             return false;

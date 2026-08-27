@@ -1423,6 +1423,7 @@ async fn register_fleet(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 async fn raw_acquire(
     global: &mut GlobalControllerClient<tonic::transport::Channel>,
     entry: &FleetEntry,
