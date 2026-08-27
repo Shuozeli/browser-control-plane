@@ -379,6 +379,139 @@ docker compose -f tests/e2e/docker-compose.wsj.yml down
 
 This is an external-network smoke test, not a deterministic CI test.
 
+## Production (k3s) Deployment
+
+This is how the live fleet actually runs today: one image, built once and rolled
+onto a controller StatefulSet plus one agent Deployment per browser host, all on
+a single k3s node and reachable over Tailscale.
+
+### Topology (namespace `dragb` on node `k3svm-yuacx`)
+
+| Component | k8s workload | Ports | Image entrypoint |
+| --- | --- | --- | --- |
+| Controller | StatefulSet `browser-control-plane` (pod `-0`) | 7000 gRPC / 7080 dashboard | `bcp-controller` |
+| Agent (per host) | Deployment `browser-control-plane-agent-<host>` | 7100 gRPC (+ 7101 raw CDP proxy) | `bcp-agent --config-path /config/agent.toml` |
+| Agent config | ConfigMap `browser-control-plane-agent-<host>` mounted at `/config/agent.toml` | — | `machine_id`, `gateway = "real-pwright"`, profiles + `cdp_url` |
+
+Hosts today: `alienware`, `armwinroot`, `ubuntu-gui`.
+
+- **Cluster access:** `ssh cyuan@k3svm-yuacx.tail8f3b66.ts.net` then
+  `sudo k3s kubectl -n dragb …`. (`k3svm-yuacx` is a VM inside `k3shost-yuacx`.)
+- **Registry:** `docker-yuacx:5000/browser-control-plane`, an **insecure (HTTP)**
+  registry. Images are tagged `:latest` **and** the full git SHA. k3s pulls it
+  via the mirror in `/etc/rancher/k3s/registries.yaml`.
+- **Tailscale operator:** each Service is fronted by a `ts-…` proxy pod in the
+  `tailscale` namespace that exposes it on the tailnet as
+  `<service>-k3spod-yuacx.tail8f3b66.ts.net`. Controller, agents, and clients all
+  find each other through these MagicDNS names — e.g. the controller is
+  `http://browser-control-plane-k3spod-yuacx.tail8f3b66.ts.net:7000`.
+
+### 1. Build the image
+
+On any host with Docker and access to the registry (one-time: add the insecure
+registry and restart Docker):
+
+```bash
+echo '{"insecure-registries":["docker-yuacx:5000"]}' | sudo tee /etc/docker/daemon.json
+sudo systemctl restart docker
+
+cd browser-control-plane
+SHA=$(git rev-parse HEAD)
+docker build \
+  -t docker-yuacx:5000/browser-control-plane:latest \
+  -t docker-yuacx:5000/browser-control-plane:$SHA .
+```
+
+The `Dockerfile` builds `bcp-controller`/`bcp-client`/`bcp-e2e` with default
+features **and `bcp-agent` with `--features real-pwright`** in a dedicated step.
+The feature is mandatory: without it the agent compiles a stub that errors at
+runtime and cannot drive a real browser. Sanity-check the built binary:
+
+```bash
+docker create --name _c docker-yuacx:5000/browser-control-plane:$SHA >/dev/null
+docker cp _c:/usr/local/bin/bcp-agent /tmp/bcp-agent && docker rm _c >/dev/null
+grep -aqF "real pwright CDP browser ok" /tmp/bcp-agent && echo "real-pwright OK"
+```
+
+(The image's debian-slim base has no `strings`; use `grep -a` on the copied-out
+binary, not `strings` inside the image.)
+
+### 2. Push
+
+```bash
+docker push docker-yuacx:5000/browser-control-plane:latest
+docker push docker-yuacx:5000/browser-control-plane:$SHA
+```
+
+### 3. Roll the workloads — pin to the SHA tag
+
+Do **not** rely on `rollout restart` + `:latest`. With `imagePullPolicy: Always`
+plus the registry mirror there is a cache race where a fresh pod can pull the
+stale `:latest`. Pin the immutable SHA tag instead:
+
+```bash
+IMG=docker-yuacx:5000/browser-control-plane:$SHA
+for h in alienware armwinroot ubuntu-gui; do
+  sudo k3s kubectl set image deploy/browser-control-plane-agent-$h "*=$IMG" -n dragb
+done
+# Roll the controller too whenever the gRPC contract grew (new RPCs), or its
+# older binary will answer new agent calls with `Unimplemented`.
+sudo k3s kubectl set image statefulset/browser-control-plane "*=$IMG" -n dragb
+
+sudo k3s kubectl rollout status deploy/browser-control-plane-agent-alienware -n dragb
+# Confirm the running pod is the new image:
+sudo k3s kubectl get pod <pod> -n dragb \
+  -o jsonpath='{.status.containerStatuses[0].imageID}'
+```
+
+### 4. Verify
+
+```bash
+CTRL=http://browser-control-plane-k3spod-yuacx.tail8f3b66.ts.net:7000
+bcp-client --controller $CTRL machines            # control plane -> 3
+# Data plane (allow ~40s after a roll for the agent to re-register its profiles):
+bcp-client --controller $CTRL eval --platform youtube \
+  --account-id <account> --expression "location.host"
+sudo k3s kubectl logs -n dragb <agent-pod> \
+  | grep -E "lease sync reconciled|Connection closed"
+```
+
+### Changing profiles or CDP ports
+
+Agent profiles (and their `cdp_url` ports) live in the ConfigMap
+`browser-control-plane-agent-<host>` (`agent.toml`). Edit it
+(`sudo k3s kubectl edit cm browser-control-plane-agent-<host> -n dragb`), then
+`rollout restart` that agent Deployment so it re-reads `/config/agent.toml`.
+
+### Operational gotchas (learned the hard way)
+
+1. **`--features real-pwright` in the Dockerfile is mandatory** — the default
+   build's stub errors at runtime.
+2. **Pin rolls to the SHA tag**, not `:latest` (mirror cache race). The three
+   agents are currently pinned to a SHA, so a new `:latest` push does **not**
+   auto-roll them.
+3. **Roll the controller when the gRPC contract grows** — a stale controller
+   returned `Unimplemented` for `ListMachineLeases`, breaking agent lease-sync
+   fleet-wide until it was rolled.
+4. **The build host needs `docker-yuacx:5000` in `insecure-registries`.**
+5. **`:7101` (raw CDP proxy) is only on the `alienware` Service** (a live patch
+   that persisted); `armwinroot` and `ubuntu-gui` Services expose only `7100`.
+   Add `7101` to those Services when their raw proxy is needed.
+6. **No k8s manifests live in this repo** — the Deployments, Services, and
+   ConfigMaps exist only in the cluster (not GitOps'd). This is the biggest gap;
+   pulling them into source (and folding in the `:7101` port) is the clear next
+   step.
+7. **Verify CI against CI's toolchain.** `dtolnay/rust-toolchain@stable` floats,
+   so a clippy bump (e.g. 1.98's `result_large_err` on generated tonic code) can
+   turn CI red without any local change; reproduce with `cargo +stable …`. When
+   watching CI, read `gh run watch --exit-status`'s own exit code — do not pipe
+   it through `tail`, which masks the failure.
+8. **Heavy CDP from the agent pods is unreliable** (Bug 2 in
+   `handoff-agent-dataplane-connection-closed.md`): light ops work, but a
+   sustained CDP stream to a browser host resets ~10-16 KB from a pod while a
+   normal tailnet host is fine. The durable fix is to run agents **on** their
+   browser hosts (`localhost -> Chrome`) rather than as pods; not yet done.
+
 ## Environment Variables
 
 | Variable | Used by | Meaning |
