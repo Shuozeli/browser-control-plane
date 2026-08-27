@@ -27,6 +27,10 @@ are otherwise healthy).
 >
 > Separately still true: `armwinroot` profile points at dead `:9227` (fix the port);
 > `acquire` vs `eval` resolve accounts differently (secondary quirk).
+>
+> **UPDATE 2026-08-27 — there are TWO bugs; the stale-cache fix is deployed but a
+> second one remains. See the "Update (2026-08-27)" section at the bottom.** The
+> follow-up notes below (2026-08-23) predate the fix and are partly stale.
 
 ## One-line
 
@@ -140,6 +144,49 @@ ws.send(json.dumps({"id":1,"method":"Browser.getVersion"})); print(ws.recv()[:80
 PY
 ```
 
+## Follow-up findings (2026-08-23, from the media-downloader side)
+
+Re-tested to wire the catalog pipeline's discovery onto BCP. State:
+
+1. **Data plane is only PARTIALLY recovered.** `eval youtube/alienware-browser-user1`
+   now returns `www.google.com` (alienware agent was restarted ✅). But
+   `youtube/shuoze` and `youtube/yuacx2` (the **ubuntu-gui** agent) still return
+   `Connection closed` — that agent still holds the stale cached CDP handle and
+   needs a `rollout restart` (or the reconnect fix). `armwinroot` profiles still
+   point at dead `:9227`.
+
+2. **BLOCKER for external raw-CDP clients: the agent raw-CDP proxy port is not
+   exposed on the tailnet.** The agent serves the raw CDP proxy on `grpc_port + 1`
+   (`:7101`, `spawn_cdp_proxy` in `bcp-agent/src/main.rs`), but only `:7100`
+   (gRPC) and `:7080` (dashboard) are reachable — `:7101` times out on both the
+   pod IP (100.103.239.55) and MagicDNS. Verified: `acquire` + `install` succeed
+   and the lease is accepted, but `GET http://<agent>:7101/<profile>/json/version?bcpLease=…`
+   is unreachable. The discovery scraper drives **raw CDP** (needs `/json/new` +
+   ws + `Network.getResponseBody` for Douyin), which the semantic gateway
+   (`Evaluate`/`RunScript`) can't fully cover — so it needs `:7101`.
+   **Ask: expose each agent's `:7101` as a tailnet-reachable port** (k8s Service /
+   hostPort / `BCP_AGENT_PROXY_ADDR` bound to the pod's tailnet interface), the
+   same way `:7100` is. Once `:7101` is reachable, the pipeline's `acquire()` can
+   lease via bcp-proto and drive the leased raw-CDP proxy directly.
+
+## Actions taken from the media-downloader side (2026-08-23)
+
+- **Exposed `:7101` on the alienware agent** so external raw-CDP clients can reach
+  the proxy: `kubectl -n dragb patch svc browser-control-plane-agent-alienware`
+  adding a `cdp-proxy` port `7101` (the `tailscale.com/expose` proxy bridges it).
+  **This is a live patch, NOT in a source manifest — add port 7101 to the agent
+  Service manifest(s) so it survives redeploys, and do the same for armwinroot /
+  ubuntu-gui.** Verified: raw CDP now drives through
+  `http://<agent>:7101/<profile>/json/list?bcpLease=…` (client must rewrite the
+  advertised `0.0.0.0` ws host to the dialed host).
+- Confirmed the **raw-CDP proxy path hits the same agent bug**: a lease's first
+  scrape works (drove a real page, extracted 25–30 video tiles), but subsequent
+  ws sessions get `Connection reset without closing handshake`. So the
+  `RealPwrightGateway` stale/again-dead cached-handle issue affects the raw proxy
+  too — the permanent reconnect/health-check fix is still needed. `eval` currently
+  works on `alienware-browser-user1 / -yuanchenxi2025 / -yuanchenxi2026`; `user4`
+  + `alienware` return "no available profile matched"; ubuntu-gui still stale.
+
 ## Why this matters
 
 The media-downloader "catalog pipeline" (discovery service) is designed to lease
@@ -147,3 +194,44 @@ browsers via BCP + drive them with `pwright-bridge`. It is blocked on this. Once
 the data plane drives browsers again, the discovery service can go through BCP;
 until then it can only use a direct-CDP dev fallback.
 See `~/projects/personal/media-downloader/docs/design/11-decoupled-discovery-download.md`.
+
+## Update (2026-08-27): fixes deployed + second root cause reconciled
+
+There are **two independent bugs**. The earlier notes conflated them.
+
+### Bug 1 — stale cached CDP connection — FIXED and DEPLOYED
+`RealPwrightGateway` reused a dead cached websocket forever (11-day wedge). Fixed
+by evict-and-retry-once reconnect (`with_reconnect` / `is_connection_closed` in
+`crates/bcp-core/src/pwright.rs`, commit `35e82d8`). Also shipped: Phase 8 raw-proxy
+clean teardown + `/json/new` (`480f0c0`), a Dockerfile fix so the image actually
+builds the agent with `--features real-pwright` (`7561bd7`). Built image
+`5235f1ba` (tag `480f0c0…`), rolled onto **all three agents + the controller**
+(pinned to the SHA tag). `eval location.host` returns `www.google.com`;
+`ListMachineLeases` lease-sync now works (controller was stale and returned
+`Unimplemented` until rolled).
+
+### Bug 2 — pod -> tailnet egress cannot sustain HEAVY CDP — STILL OPEN
+Reproduced firmly: a heavy sustained CDP stream (real page / event flood) from a
+**k3s agent pod** to a browser host **resets/black-holes at ~10-16 KB**
+(`Connection reset without closing handshake` / recv timeout), while the *same*
+drive from a **normal tailnet host works with no reset** (a local `bcp-agent`
+streamed a real youtube page for tens of seconds; a pod died at ~16 KB). Light
+ops (`eval` on a light page) pass; heavy scraping does not. An MSS clamp on the
+node's `tailscale0` did **not** move the cutoff, so the mechanism is some
+tailscale-egress / long-lived-WS interaction from the pods, not simple segment
+MTU. This — not Bug 1 — is what breaks real scraping and the raw-proxy sessions.
+
+NB: my 2026-08-23 "MTU/pod-egress is a red herring" claim was wrong; it was based
+on a *light* drive test that never pushed enough data to trip Bug 2.
+
+**Fix for Bug 2: run each agent ON its browser host (`localhost -> Chrome`)** so
+the heavy data plane never traverses the pod->tailnet path. Not yet done (spans
+2 Windows hosts + 1 Linux). ubuntu-gui was brought up on the fixed image but,
+being a pod, still hits Bug 2 on heavy CDP.
+
+### Still open
+- Bug 2 fix (on-host agents) — not started.
+- `:7101` raw-proxy port is only a live `kubectl patch` on alienware — not in a
+  source manifest, not on armwinroot/ubuntu-gui.
+- `armwinroot` profile still points at dead `:9227`.
+- Agent Deployments are pinned to the SHA tag (`480f0c0…`), not `:latest`.
