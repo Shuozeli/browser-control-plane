@@ -204,9 +204,9 @@ There are **two independent bugs**. The earlier notes conflated them.
 by evict-and-retry-once reconnect (`with_reconnect` / `is_connection_closed` in
 `crates/bcp-core/src/pwright.rs`, commit `35e82d8`). Also shipped: Phase 8 raw-proxy
 clean teardown + `/json/new` (`480f0c0`), a Dockerfile fix so the image actually
-builds the agent with `--features real-pwright` (`7561bd7`). Built image
-`5235f1ba` (tag `480f0c0…`), rolled onto **all three agents + the controller**
-(pinned to the SHA tag). `eval location.host` returns `www.google.com`;
+builds the agent with `--features real-pwright` (`7561bd7`). Built and pushed the
+image (tag `480f0c0…`, digest `sha256:5235f1ba0db9…`), rolled onto **all three
+agents + the controller** (pinned to the SHA tag). `eval location.host` returns `www.google.com`;
 `ListMachineLeases` lease-sync now works (controller was stale and returned
 `Unimplemented` until rolled).
 
