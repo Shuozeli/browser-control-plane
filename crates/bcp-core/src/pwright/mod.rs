@@ -57,8 +57,10 @@ pub trait PwrightGateway: Send + Sync {
     ) -> Result<String, PwrightError>;
     /// Print the page to PDF, returning base64-encoded PDF bytes.
     async fn print_pdf(&self, profile_id: &str) -> Result<String, PwrightError>;
-    /// Return all cookies visible to the page as a JSON array string. Includes
-    /// httpOnly cookies, which page JavaScript cannot read.
+    /// Return the page's cookies as a JSON array string. This reads
+    /// `document.cookie`, so it returns name/value pairs only and does NOT
+    /// include httpOnly cookies (page JavaScript cannot see them) — retrieve
+    /// those over the raw CDP proxy (`Network.getCookies`).
     async fn get_cookies(&self, profile_id: &str) -> Result<String, PwrightError>;
     /// Set cookies from a JSON array (subset fields allowed; the rest default).
     /// Returns the number of cookies applied.

@@ -67,11 +67,13 @@ impl RealPwrightGateway {
         match error {
             PwrightError::OperationFailed(_, message) => {
                 let message = message.to_ascii_lowercase();
+                // Match full transport-failure phrases (not a bare "reset", which
+                // can appear in an ordinary application/JS error).
                 message.contains("connection closed")
-                    || message.contains("reset")
+                    || message.contains("connection reset")
+                    || message.contains("reset without closing handshake")
                     || message.contains("closing handshake")
                     || message.contains("broken pipe")
-                    || message.contains("not connected")
             }
             _ => false,
         }
@@ -399,8 +401,11 @@ impl PwrightGateway for RealPwrightGateway {
             step.apply_params(&params);
         }
 
-        // Run the program; if a step fails because the cached CDP connection is
-        // dead, evict it and restart the program once against a fresh connection.
+        // Run the program; if the FIRST step fails because the cached CDP
+        // connection is dead (a stale handle), evict it and restart the program
+        // once against a fresh connection. A later step failing mid-script is not
+        // replayed — earlier steps already ran and may not be idempotent, so the
+        // closed-connection error is surfaced instead.
         let mut reconnected = false;
         let lines = loop {
             let page = self.page_for_profile(profile_id).await?;
@@ -418,8 +423,9 @@ impl PwrightGateway for RealPwrightGateway {
                         .to_string(),
                     }),
                     Err(error) => {
-                        if !reconnected && Self::is_connection_closed(&error) {
-                            // Stale cached connection: reconnect and rerun once.
+                        if index == 0 && !reconnected && Self::is_connection_closed(&error) {
+                            // Stale cached connection on the first step: reconnect
+                            // and rerun the program once (nothing has run yet).
                             restart = true;
                             break;
                         }
@@ -814,6 +820,10 @@ mod real_pwright_tests {
         )));
         assert!(!RealPwrightGateway::is_connection_closed(&op_failed(
             "unsupported real-browser action: teleport"
+        )));
+        // A bare "reset" in ordinary error text must NOT trigger a reconnect.
+        assert!(!RealPwrightGateway::is_connection_closed(&op_failed(
+            "clicking '#reset' did not reset the form"
         )));
         assert!(!RealPwrightGateway::is_connection_closed(
             &PwrightError::ProfileNotFound("profile".to_string())
